@@ -41,6 +41,11 @@ parts:
   super8:
     plugin: python
     source: .
+    build-environment:
+      # The gnome extension puts the GNOME SDK's Python packages on PYTHONPATH. Its old pip (24.0)
+      # then shadows the virtualenv's own pip, and pip >= 26 crashes on start
+      # ("cannot import name 'cli'"). Nothing in this part needs the SDK's Python modules.
+      - PYTHONPATH: ""
     override-pull: |
       craftctl default
       craftctl set version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' super8/__init__.py)"
