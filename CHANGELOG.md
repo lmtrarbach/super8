@@ -2,8 +2,6 @@
 
 ## 0.2.0 — 2026-11-21
 
-First stable release on the Snap Store (`sudo snap install super8-editor`).
-
 ### Timeline zoom
 - Zoom bar with a mini-map of the whole sequence: drag the view box to pan, drag its
   edges to zoom, click to jump, double-click to fit
@@ -16,12 +14,9 @@ First stable release on the Snap Store (`sudo snap install super8-editor`).
   Alt+= / Alt+-) and a vertical scrollbar
 - Clip names stay visible when a clip starts off-screen
 
-### Packaging
-- Snap build fix: the GNOME SDK's old pip no longer shadows the build's pip
-
 ## 0.1.0 — 2026-11-21
 
-First version (edge channel only).
+First release, on the Snap Store's stable channel (`sudo snap install super8-editor`).
 
 - Multi-track timeline with linked audio/video, snapping, overwrite edits and unlimited undo
 - Editing tools: selection, track select forward, ripple, rolling, rate stretch, razor,
@@ -32,3 +27,4 @@ First version (edge channel only).
 - Silence detector (cut, speed up or mark pauses) and background noise reduction
 - Export to H.264/AAC MP4, MKV or MOV
 - Help → Support Super8 with donation addresses
+- Snap build fix: the GNOME SDK's old pip no longer shadows the build's pip
