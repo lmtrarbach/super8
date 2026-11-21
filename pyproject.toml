@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "super8"
+dynamic = ["version"]
+description = "A non-linear video editor for Linux"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+dependencies = ["PyQt6>=6.6", "av>=12", "numpy>=1.26"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyflakes"]
+
+[project.gui-scripts]
+super8 = "super8.__main__:main"
+
+[tool.setuptools]
+packages = ["super8", "super8.ui", "super8.resources"]
+
+[tool.setuptools.dynamic]
+version = {attr = "super8.__version__"}
+
+[tool.setuptools.package-data]
+"super8.resources" = ["*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

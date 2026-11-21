@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Super8
+GenericName=Video Editor
+Comment=Edit videos with transitions, titles and silence cutting
+Exec=super8-editor.super8 %F
+Icon=${SNAP}/meta/gui/super8.png
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+Keywords=video;editor;timeline;cut;montage;premiere;
+MimeType=video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;
+StartupWMClass=super8

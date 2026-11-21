@@ -1,0 +1,65 @@
+name: super8-editor
+title: Super8
+base: core24
+adopt-info: super8   # version comes from super8/__init__.py
+summary: Non-linear video editor with transitions, graphics and silence cutting
+description: |
+  Super8 is a free video editor for Linux in the spirit of Premiere.
+
+  * Multi-track timeline with linked audio/video, snapping and unlimited undo
+  * Editing tools: selection, track select, ripple, rolling, rate stretch,
+    razor, slip, slide, hand, zoom and type
+  * Transitions: dissolves, dips, wipes, pushes, iris, graphic sweeps and
+    audio crossfades
+  * Animated graphics: lower thirds, captions, credits rolls, tickers and
+    your own reusable templates
+  * Silence detector that cuts or speeds up pauses in talking-head footage,
+    and background noise reduction
+  * Export to H.264/AAC MP4, MKV or MOV
+
+  Everything runs locally; Super8 needs no account and no network.
+license: GPL-3.0-only
+icon: snap/gui/super8.png
+grade: stable
+confinement: strict
+platforms:
+  amd64:
+  arm64:
+
+apps:
+  super8:
+    command: bin/super8
+    extensions: [gnome]
+    plugs:
+      - home
+      - removable-media   # footage on USB drives and SD cards
+      - audio-playback    # preview playback
+    environment:
+      QT_QPA_PLATFORM: "wayland;xcb"
+
+parts:
+  super8:
+    plugin: python
+    source: .
+    override-pull: |
+      craftctl default
+      craftctl set version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' super8/__init__.py)"
+    override-build: |
+      craftctl default
+      # The GTK3 theme plugin in the PyQt6 wheel calls gtk_init(), which aborts when the GNOME
+      # settings schemas don't match the GTK build. Super8 draws its own theme, so drop it.
+      rm -f "$CRAFT_PART_INSTALL"/lib/python3*/site-packages/PyQt6/Qt6/plugins/platformthemes/libqgtk3.so
+    stage-packages:
+      # Qt Multimedia's audio output (preview playback) talks to PulseAudio / PipeWire.
+      - libpulse0
+      # Needed by Qt's X11 backend (used when Wayland isn't available).
+      - libxcb-cursor0
+      - libxcb-icccm4
+      - libxcb-image0
+      - libxcb-keysyms1
+      - libxcb-randr0
+      - libxcb-render-util0
+      - libxcb-shape0
+      - libxcb-xinerama0
+      - libxcb-xkb1
+      - libxkbcommon-x11-0
