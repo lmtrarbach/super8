@@ -44,6 +44,7 @@ class Bridge(QObject):
     export_progress = pyqtSignal(int, int)
     export_done = pyqtSignal(bool, str)
     variant_ready = pyqtSignal(str, float)
+    filmstrip = pyqtSignal(str, object)
     variant_progress = pyqtSignal(str, float)
 
 
@@ -220,6 +221,7 @@ class MainWindow(QMainWindow):
         self.history = History()
         self.audio_cache = AudioCache()
         self.thumbs: dict[str, QImage] = {}
+        self.filmstrips: dict[str, tuple] = {}  # media id -> (times, [QImage]) for the timeline
         self.playhead = 0.0
         self.playing = False
         self.rev = 0
@@ -234,8 +236,9 @@ class MainWindow(QMainWindow):
         self.bridge.variant_progress.connect(self._on_variant_progress)
         self.audio_cache.on_variant = self.bridge.variant_ready.emit
         self.audio_cache.on_variant_progress = self.bridge.variant_progress.emit
+        self.bridge.filmstrip.connect(self._on_filmstrip)
         self.loader = MediaLoader(self.audio_cache, self.bridge.thumb.emit, self.bridge.audio.emit,
-                                  self.bridge.error.emit)
+                                  self.bridge.error.emit, self.bridge.filmstrip.emit)
         self.worker = RenderWorker(self.audio_cache)
         self.worker.frame_ready.connect(self._on_frame)
         self.worker.start()
@@ -455,6 +458,13 @@ class MainWindow(QMainWindow):
         A["zoom_out"] = self._act(m, "Zoom Out", lambda: self.timeline.canvas.set_zoom(self.timeline.canvas.pps / 1.5),
                                   "-", icon_name="zoom_out")
         A["zoom_fit"] = self._act(m, "Zoom to Fit", self.timeline.canvas.zoom_fit, "\\", icon_name="zoom_fit")
+        self._act(m, "Zoom to Selection", self.zoom_selection, "Shift+Z",
+                  tip="Fill the timeline with the selected clips")
+        m.addSeparator()
+        self._act(m, "Taller Tracks", lambda: self.timeline.canvas.scale_tracks(1.25), "Alt+=",
+                  tip="Bigger waveforms and thumbnails (also Alt+wheel, or drag a track's lower edge)")
+        self._act(m, "Shorter Tracks", lambda: self.timeline.canvas.scale_tracks(1 / 1.25), "Alt+-")
+        self._act(m, "Reset Track Heights", self.timeline.canvas.reset_track_heights)
 
         m = mb.addMenu("&Graphics")
         self._act(m, "New Title", lambda: self.add_title(), icon_name="title")
@@ -600,7 +610,12 @@ class MainWindow(QMainWindow):
             c.ensure_visible(self.playhead)
         self.tc_label.setText(fmt_tc(self.playhead, self.project.fps))
         c.update()
+        self.timeline.navigator.update()
         self.request_frame()
+
+    def zoom_selection(self):
+        if not self.timeline.canvas.zoom_selection():
+            self.statusBar().showMessage("Select one or more clips to zoom to", 3000)
 
     def on_seek(self, t: float):
         self.set_playhead(t, follow=False)
@@ -1395,7 +1410,9 @@ Ctrl+Shift+D detect silences (cut, speed up or mark) · Ctrl+Shift+N noise reduc
 <b>Graphics</b><br>Graphics tab: drag a template onto a video track (or double-click) · edit text, style and
 animation in the Inspector · drag it in the Program Monitor to place it · Inspector ▸ Save as Graphics Template<br><br>
 <b>Timeline view</b><br>Wheel scroll · Ctrl+wheel zoom · Shift+wheel scroll tracks · Middle-drag pan ·
-= / - zoom · \\ zoom to fit<br><br>
+= / - zoom (around the playhead) · \\ zoom to fit · Shift+Z zoom to selection ·
+Zoom tool: drag a range to fill the view · zoom bar: drag the box to pan, its edges to zoom ·
+Alt+wheel or Alt+= / Alt+- track height (drag a track's lower edge in the header for one track)<br><br>
 <b>Media</b><br>Ctrl+I import · drag from bin to timeline · double-click media to insert at playhead ·
 Ctrl+M export
 """)
@@ -1412,6 +1429,16 @@ Ctrl+M export
     # window is gone instead of calling into deleted widgets
     def _on_frame(self, img):
         self.monitor.set_image(img)
+
+    def _on_filmstrip(self, mid: str, strip):
+        times, frames = strip
+        images = []
+        for arr in frames:
+            h, w = arr.shape[:2]
+            arr = np.ascontiguousarray(arr)
+            images.append(QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy())
+        self.filmstrips[mid] = (times, images)
+        self.timeline.canvas.update()
 
     def _on_audio_loaded(self, mid: str):
         self.timeline.canvas.update()

@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import math
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
+import numpy as np
+
+from PyQt6.QtCore import QLineF, QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
-from PyQt6.QtWidgets import QScrollBar, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QScrollBar, QSlider, QToolButton, QVBoxLayout, QWidget
 
 from ..model import Clip, Track, carve, split_clip, split_with_links, transition_windows
 from ..graphics import preset_duration
+from ..media import PEAKS_PER_SEC
 from ..transitions import short_label
 from . import icons
 
@@ -18,8 +21,10 @@ GRAPHIC_MIME = "application/x-super8-graphic"
 
 HEADER = 96
 RULER = 28
-VIDEO_H = 58
+VIDEO_H = 58  # default track heights
 AUDIO_H = 50
+MIN_TRACK_H, MAX_TRACK_H = 30, 320
+MIN_PPS, MAX_PPS = 0.05, 4000.0  # pixels per second: ~3 hours across a screen .. ~130 px per frame at 30 fps
 GAP = 8
 EDGE = 7  # px grab zone for trimming
 SNAP_PX = 9
@@ -89,6 +94,8 @@ class TimelineCanvas(QWidget):
         self.markers: list[tuple[float, float]] = []  # e.g. detected silences, drawn in red
         self.tghost = None  # (track, t0, t1) while dragging a transition
         self.gghost = None  # (template id, track, t, duration) while dragging a graphic
+        self.track_heights: dict[str, int] = {}  # view state: track id -> height in px
+        self.zoom_band = None  # (x0, x1) while dragging a range with the Zoom tool
         self.drag = None
         self.ghost = None  # (media_id, t, track) while dragging from the bin
         self.snap_line = None
@@ -101,6 +108,10 @@ class TimelineCanvas(QWidget):
     def project(self):
         return self.main.project
 
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.clamp_scroll_y()
+
     # ------------------------------------------------------------ geometry
     def t2x(self, t: float) -> float:
         return HEADER + (t - self.scroll_t) * self.pps
@@ -108,20 +119,52 @@ class TimelineCanvas(QWidget):
     def x2t(self, x: float) -> float:
         return (x - HEADER) / self.pps + self.scroll_t
 
+    def track_h(self, tr: Track) -> int:
+        return self.track_heights.get(tr.id, VIDEO_H if tr.kind == "video" else AUDIO_H)
+
     def rows(self) -> list[tuple[Track, int, int]]:
         out, y = [], RULER - self.scroll_y
         for tr in reversed(self.project.video_tracks):
-            out.append((tr, y, VIDEO_H))
-            y += VIDEO_H
+            h = self.track_h(tr)
+            out.append((tr, y, h))
+            y += h
         y += GAP
         for tr in self.project.audio_tracks:
-            out.append((tr, y, AUDIO_H))
-            y += AUDIO_H
+            h = self.track_h(tr)
+            out.append((tr, y, h))
+            y += h
         return out
 
     def content_height(self) -> int:
-        p = self.project
-        return RULER + len(p.video_tracks) * VIDEO_H + GAP + len(p.audio_tracks) * AUDIO_H
+        return RULER + GAP + sum(self.track_h(t) for t in self.project.tracks())
+
+    def clamp_scroll_y(self):
+        self.scroll_y = int(min(max(0, self.content_height() - self.height()), max(0, self.scroll_y)))
+        self.view_changed.emit()
+
+    def set_track_height(self, tr: Track, h: float):
+        self.track_heights[tr.id] = int(min(MAX_TRACK_H, max(MIN_TRACK_H, h)))
+        self.clamp_scroll_y()
+        self.update()
+
+    def scale_tracks(self, factor: float):
+        """Make every track taller (factor > 1) or shorter, e.g. to read waveforms in detail."""
+        for tr in self.project.tracks():
+            self.set_track_height(tr, self.track_h(tr) * factor)
+
+    def reset_track_heights(self):
+        self.track_heights.clear()
+        self.clamp_scroll_y()
+        self.update()
+
+    def header_edge_at(self, x: float, y: float) -> Track | None:
+        """Track whose lower edge (in the header) is under the pointer: dragging it resizes the track."""
+        if x >= HEADER or y < RULER:
+            return None
+        for tr, ty, h in self.rows():
+            if abs(y - (ty + h)) <= 3:
+                return tr
+        return None
 
     def track_at(self, y: float) -> Track | None:
         for tr, ty, h in self.rows():
@@ -159,20 +202,43 @@ class TimelineCanvas(QWidget):
         return QRectF(HEADER - 30, y + (h - 20) / 2, 22, 20)
 
     # ------------------------------------------------------------ zoom/scroll
+    def visible_seconds(self) -> float:
+        return max(1, self.width() - HEADER) / self.pps
+
     def set_zoom(self, pps: float, anchor_x: float | None = None):
-        anchor_x = self.width() / 2 if anchor_x is None else anchor_x
+        """Zoom keeping the time under `anchor_x` still. By default that is the playhead when it is on
+        screen (like Premiere), otherwise the middle of the view."""
+        if anchor_x is None:
+            px = self.t2x(self.playhead)
+            anchor_x = px if HEADER <= px <= self.width() else HEADER + (self.width() - HEADER) / 2
         anchor_t = self.x2t(anchor_x)
-        self.pps = min(2000.0, max(2.0, pps))
+        self.pps = min(MAX_PPS, max(MIN_PPS, pps))
         self.scroll_t = max(0.0, anchor_t - (anchor_x - HEADER) / self.pps)
         self.view_changed.emit()
         self.update()
 
-    def zoom_fit(self):
-        d = max(5.0, self.project.duration())
-        self.pps = min(2000.0, max(2.0, (self.width() - HEADER - 30) / d))
-        self.scroll_t = 0.0
+    def zoom_to_range(self, t0: float, t1: float, margin: float = 0.03):
+        """Fill the view with [t0, t1] (plus a small margin each side)."""
+        t0, t1 = max(0.0, min(t0, t1)), max(t0, t1)
+        span = max(t1 - t0, 2 / self.project.fps)
+        width = max(1, self.width() - HEADER)
+        self.pps = min(MAX_PPS, max(MIN_PPS, width / (span * (1 + 2 * margin))))
+        self.scroll_t = max(0.0, t0 - span * margin)
+        if self.pps == MAX_PPS:  # could not zoom that far: centre the range instead
+            self.scroll_t = max(0.0, (t0 + t1) / 2 - self.visible_seconds() / 2)
         self.view_changed.emit()
         self.update()
+
+    def zoom_fit(self):
+        self.zoom_to_range(0.0, max(5.0, self.project.duration()), margin=0.01)
+
+    def zoom_selection(self) -> bool:
+        clips = [self.project.find_clip(cid)[1] for cid in self.selection]
+        clips = [c for c in clips if c is not None]
+        if not clips:
+            return False
+        self.zoom_to_range(min(c.start for c in clips), max(c.end for c in clips))
+        return True
 
     def ensure_visible(self, t: float):
         x = self.t2x(t)
@@ -184,10 +250,17 @@ class TimelineCanvas(QWidget):
         dy = e.angleDelta().y() or e.angleDelta().x()
         mods = e.modifiers()
         if mods & Qt.KeyboardModifier.ControlModifier:
-            self.set_zoom(self.pps * (1.2 if dy > 0 else 1 / 1.2), e.position().x())
+            self.set_zoom(self.pps * (1.2 if dy > 0 else 1 / 1.2), max(HEADER, e.position().x()))
+        elif mods & Qt.KeyboardModifier.AltModifier:
+            tr = self.track_at(e.position().y())
+            factor = 1.15 if dy > 0 else 1 / 1.15
+            if tr is not None and e.position().x() < HEADER:
+                self.set_track_height(tr, self.track_h(tr) * factor)  # over a header: just that track
+            else:
+                self.scale_tracks(factor)
         elif mods & Qt.KeyboardModifier.ShiftModifier:
-            max_y = max(0, self.content_height() - self.height())
-            self.scroll_y = int(min(max_y, max(0, self.scroll_y - dy / 2)))
+            self.scroll_y -= int(dy / 2)
+            self.clamp_scroll_y()
             self.update()
         else:
             self.scroll_t = max(0.0, self.scroll_t - dy / 120 * 80 / self.pps)
@@ -278,6 +351,10 @@ class TimelineCanvas(QWidget):
             self.drag = {"mode": "scrub"}
             self.seek.emit(max(0.0, self.x2t(x)))
             return
+        edge_tr = self.header_edge_at(x, y)
+        if edge_tr is not None:
+            self.drag = {"mode": "track_resize", "track": edge_tr, "y": y, "h": self.track_h(edge_tr)}
+            return
         if x < HEADER:
             for tr, ty, h in self.rows():
                 if self.toggle_rect(ty, h).contains(QPointF(x, y)):
@@ -289,8 +366,9 @@ class TimelineCanvas(QWidget):
         tool = self.tool
         t = max(0.0, self.x2t(x))
         if tool == "zoom":
-            out = bool(mods & Qt.KeyboardModifier.AltModifier)
-            self.set_zoom(self.pps * (1 / 1.6 if out else 1.6), x)
+            # click: zoom in (Alt: out) around the pointer; drag: zoom to the dragged range
+            self.drag = {"mode": "zoom_box", "x": x, "out": bool(mods & Qt.KeyboardModifier.AltModifier)}
+            self.zoom_band = (x, x)
             return
         tr, clip, edge = self.hit(x, y)
         if tool == "type":
@@ -430,6 +508,13 @@ class TimelineCanvas(QWidget):
             max_y = max(0, self.content_height() - self.height())
             self.scroll_y = int(min(max_y, max(0, d["scroll_y"] - (y - d["y"]))))
             self.view_changed.emit()
+            self.update()
+            return
+        if d["mode"] == "track_resize":
+            self.set_track_height(d["track"], d["h"] + (y - d["y"]))
+            return
+        if d["mode"] == "zoom_box":
+            self.zoom_band = (d["x"], max(HEADER, min(self.width(), x)))
             self.update()
             return
         if d["mode"] == "scrub":
@@ -692,6 +777,15 @@ class TimelineCanvas(QWidget):
         d, self.drag = self.drag, None
         self.snap_line = None
         self.overlay = None
+        if d and d["mode"] == "zoom_box":
+            self.zoom_band = None
+            x0, x1 = sorted((d["x"], max(HEADER, min(self.width(), e.position().x()))))
+            if x1 - x0 > 6:
+                self.zoom_to_range(self.x2t(x0), self.x2t(x1), margin=0.0)
+            else:
+                self.set_zoom(self.pps * (1 / 1.6 if d["out"] else 1.6), d["x"])
+            self.update()
+            return
         if d and d.get("changed") and "before" in d:
             if d["mode"] in ("move", "left", "right", "rate_left", "rate_right"):
                 # overwrite whatever the edited clips now cover
@@ -710,6 +804,9 @@ class TimelineCanvas(QWidget):
             self.seek.emit(clip.start)
 
     def _update_cursor(self, x, y):
+        if self.header_edge_at(x, y) is not None:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+            return
         if x < HEADER or y < RULER:
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
@@ -915,7 +1012,8 @@ class TimelineCanvas(QWidget):
             p.fillRect(r, QColor("#c94f4f") if active else QColor("#3a3f49"))
             p.setPen(QColor("#ffffff") if active else QColor("#9aa0ab"))
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, ("H" if tr.kind == "video" else "M"))
-        p.fillRect(0, RULER - self.scroll_y + len(self.project.video_tracks) * VIDEO_H, W, GAP, QColor("#121317"))
+        gap_y = RULER - self.scroll_y + sum(self.track_h(t) for t in self.project.video_tracks)
+        p.fillRect(0, gap_y, W, GAP, QColor("#121317"))
 
         self._paint_ruler(p, W)
         for a, b in self.markers:
@@ -932,6 +1030,20 @@ class TimelineCanvas(QWidget):
             p.fillRect(r, QColor(10, 11, 13, 225))
             p.setPen(QColor("#ffd34d"))
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
+
+        if self.zoom_band:
+            a, b = sorted(self.zoom_band)
+            p.fillRect(QRectF(a, 0, b - a, H), QColor(77, 163, 255, 45))
+            p.setPen(QPen(QColor("#4da3ff"), 1))
+            p.drawLine(int(a), 0, int(a), H)
+            p.drawLine(int(b), 0, int(b), H)
+            if b - a > 6:
+                span = (b - a) / self.pps
+                txt = f"Zoom to {fmt_tc(span, self.project.fps)}"
+                p.fillRect(QRectF(a + 4, RULER + 4, p.fontMetrics().horizontalAdvance(txt) + 10, 18),
+                           QColor(10, 11, 13, 220))
+                p.setPen(QColor("#9ccaff"))
+                p.drawText(QRectF(a + 9, RULER + 4, 400, 18), Qt.AlignmentFlag.AlignVCenter, txt)
 
         # playhead
         px = self.t2x(self.playhead)
@@ -991,6 +1103,87 @@ class TimelineCanvas(QWidget):
             p.drawText(r.adjusted(3, 0, -3, 0), Qt.AlignmentFlag.AlignCenter, label)
         p.restore()
 
+    def _visible_span(self, inner: QRectF) -> tuple[int, int]:
+        return max(int(inner.left()), HEADER), min(int(math.ceil(inner.right())), self.width())
+
+    def _paint_frames(self, p: QPainter, c: Clip, m, r: QRectF, inner: QRectF):
+        """Thumbnail tiles; with a filmstrip each tile shows the frame at its own position, so zooming
+        in reveals the actual pictures."""
+        thumb = self.main.thumbs.get(m.id)
+        strip = self.main.filmstrips.get(m.id) if c.kind == "video" else None
+        ref = strip[1][0] if strip else thumb
+        if ref is None or inner.height() <= 4:
+            return
+        tw = max(8.0, ref.width() * inner.height() / ref.height())
+        x0, x1 = self._visible_span(inner)
+        if x1 <= x0:
+            return
+        p.save()
+        p.setClipRect(QRectF(x0, inner.top(), x1 - x0, inner.height()))
+        k = max(0, int((x0 - inner.left()) // tw))  # first visible tile: never loop over off-screen ones
+        x = inner.left() + k * tw
+        while x < x1:
+            img = thumb
+            if strip:
+                times, images = strip
+                t_src = c.in_point + (x + tw / 2 - r.left()) / self.pps * c.speed
+                i = int(np.searchsorted(times, t_src, side="right")) - 1
+                img = images[min(max(i, 0), len(images) - 1)]
+            if img is not None:
+                p.drawImage(QRectF(x, inner.top(), tw, inner.height()), img)
+            x += tw
+        p.restore()
+
+    def _paint_waveform(self, p: QPainter, c: Clip, m, r: QRectF, inner: QRectF):
+        """Overview peaks when zoomed out; the real signed waveform from the samples when zoomed in."""
+        cache = self.main.audio_cache
+        x0, x1 = self._visible_span(inner)
+        if x1 <= x0 or inner.height() < 4:
+            return
+        mid = inner.center().y()
+        amp = inner.height() / 2 - 1
+        sr = self.project.sample_rate
+        # source time at each pixel column edge
+        cols = np.arange(x0, x1 + 1, dtype=np.float64)
+        src_t = c.in_point + (cols - r.left()) / self.pps * c.speed
+        samples_per_px = sr * c.speed / self.pps
+        data = cache.samples.get(m.id)
+        if c.denoise > 0 and cache.ready(m.id, c.denoise):
+            data = cache.get(m.id, c.denoise)
+        lines = []
+        if data is not None and samples_per_px < sr / PEAKS_PER_SEC:
+            idx = np.clip((src_t * sr).astype(np.int64), 0, len(data))
+            lo_i, hi_i = int(idx[0]), int(idx[-1])
+            if hi_i - lo_i < 1:
+                return
+            mono = data[lo_i:hi_i].mean(axis=1) * c.volume
+            starts = np.minimum(idx[:-1] - lo_i, len(mono) - 1)
+            ok = idx[:-1] < hi_i
+            vmax = np.maximum.reduceat(mono, starts)
+            vmin = np.minimum.reduceat(mono, starts)
+            p.setPen(QColor(200, 255, 220, 210))
+            for i in np.flatnonzero(ok):
+                top = mid - min(amp, max(-amp, vmax[i] * amp))
+                bot = mid - min(amp, max(-amp, vmin[i] * amp))
+                lines.append(QLineF(x0 + i, top, x0 + i, max(bot, top + 1)))
+            p.drawLines(lines)
+            p.setPen(QColor(200, 255, 220, 60))
+            p.drawLine(QPointF(x0, mid), QPointF(x1, mid))
+            return
+        peaks = cache.peaks.get(m.id)
+        if peaks is None or not len(peaks):
+            return
+        bins = (src_t * PEAKS_PER_SEC).astype(np.int64)
+        ok = (bins[:-1] >= 0) & (bins[:-1] < len(peaks))
+        b0 = np.clip(bins[:-1], 0, len(peaks) - 1)
+        vals = np.maximum.reduceat(peaks, b0) if len(b0) else b0
+        # reduceat only spans [b0[i], b0[i+1]); a single bin when columns are narrower than one bin
+        p.setPen(QColor(200, 255, 220, 170))
+        for i in np.flatnonzero(ok):
+            h = min(amp, float(vals[i]) * c.volume * amp)
+            lines.append(QLineF(x0 + i, mid - h, x0 + i, mid + h))
+        p.drawLines(lines)
+
     def _paint_clip(self, p: QPainter, tr: Track, c: Clip):
         r = self.clip_rect(tr, c)
         if r.right() < HEADER or r.left() > self.width():
@@ -1004,36 +1197,9 @@ class TimelineCanvas(QWidget):
         # thumbnail strip / waveform
         inner = r.adjusted(1, 14, -1, -1)
         if c.kind in ("video", "image") and m is not None:
-            thumb = self.main.thumbs.get(m.id)
-            if thumb is not None and inner.height() > 4:
-                tw = thumb.width() * inner.height() / thumb.height()
-                x = inner.left()
-                p.save()
-                p.setClipRect(inner.intersected(QRectF(HEADER, 0, self.width(), self.height())))
-                while x < inner.right() and x < self.width():
-                    p.drawImage(QRectF(x, inner.top(), tw, inner.height()), thumb)
-                    x += max(tw, 40)
-                    if r.width() > 2000:
-                        break
-                p.restore()
+            self._paint_frames(p, c, m, r, inner)
         elif c.kind == "audio" and m is not None:
-            peaks = self.main.audio_cache.peaks.get(m.id)
-            if peaks is not None and len(peaks):
-                p.setPen(QColor(200, 255, 220, 170))
-                mid = inner.center().y()
-                amp = inner.height() / 2
-                x0 = max(int(inner.left()), HEADER)
-                x1 = min(int(inner.right()), self.width())
-                for x in range(x0, x1):
-                    st = c.in_point + (x - r.left()) / self.pps * c.speed
-                    en = st + c.speed / self.pps
-                    i0 = int(st * 100)
-                    i1 = max(i0 + 1, int(en * 100))
-                    if i0 >= len(peaks) or i0 < 0:
-                        continue
-                    v = float(peaks[i0:i1].max()) * c.volume
-                    hgt = min(amp, v * amp)
-                    p.drawLine(x, int(mid - hgt), x, int(mid + hgt))
+            self._paint_waveform(p, c, m, r, inner)
         # fades
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setPen(Qt.PenStyle.NoPen)
@@ -1054,42 +1220,238 @@ class TimelineCanvas(QWidget):
             name = "⛓ " + name
         if abs(c.speed - 1) > 1e-6:
             name += f"  [{c.speed * 100:.0f}%]"
-        p.drawText(r.adjusted(4, -1, -2, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, name)
+        # keep the name readable when the clip starts off-screen (zoomed in)
+        label = QRectF(max(r.left(), HEADER) + 4, r.top() - 1, r.right() - max(r.left(), HEADER) - 6, r.height())
+        p.drawText(label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, name)
         p.setPen(QPen(QColor("#ffffff") if sel else QColor(0, 0, 0, 150), 2 if sel else 1))
         p.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5))
 
 
+class ZoomNavigator(QWidget):
+    """Mini-map of the whole sequence with the visible window drawn on it.
+
+    Drag the window to pan, drag its edges to zoom, click elsewhere to jump, double-click to fit,
+    wheel to zoom around the pointer."""
+
+    HANDLE = 7
+    PAD = 4
+
+    def __init__(self, canvas: TimelineCanvas):
+        super().__init__()
+        self.canvas = canvas
+        self.setFixedHeight(30)
+        self.setMouseTracking(True)
+        self.drag = None
+        self.setToolTip("Drag the box to move · drag its edges to zoom · double-click to fit the sequence")
+
+    # mapping between sequence time and navigator x
+    def span(self) -> float:
+        c = self.canvas
+        end_view = c.scroll_t + c.visible_seconds()
+        return max(5.0, c.project.duration() * 1.04, end_view, c.playhead)
+
+    def t2x(self, t: float) -> float:
+        return self.PAD + t / self.span() * (self.width() - 2 * self.PAD)
+
+    def x2t(self, x: float) -> float:
+        return max(0.0, (x - self.PAD) / max(1, self.width() - 2 * self.PAD) * self.span())
+
+    def view_rect(self) -> QRectF:
+        c = self.canvas
+        a, b = self.t2x(c.scroll_t), self.t2x(c.scroll_t + c.visible_seconds())
+        if b - a < 2 * self.HANDLE + 4:  # keep a grabbable box when zoomed far in
+            mid = (a + b) / 2
+            a, b = mid - self.HANDLE - 2, mid + self.HANDLE + 2
+        return QRectF(a, 3, b - a, self.height() - 6)
+
+    def _part(self, x: float) -> str:
+        r = self.view_rect()
+        if abs(x - r.left()) <= self.HANDLE:
+            return "left"
+        if abs(x - r.right()) <= self.HANDLE:
+            return "right"
+        return "inside" if r.left() < x < r.right() else "outside"
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        c = self.canvas
+        x = e.position().x()
+        part = self._part(x)
+        if part == "outside":  # jump: centre the view on the clicked time, then keep dragging
+            c.scroll_t = max(0.0, self.x2t(x) - c.visible_seconds() / 2)
+            c.view_changed.emit()
+            c.update()
+            part = "inside"
+        self.drag = {"part": part, "x": x, "scroll": c.scroll_t, "end": c.scroll_t + c.visible_seconds()}
+
+    def mouseMoveEvent(self, e):
+        x = e.position().x()
+        if self.drag is None:
+            part = self._part(x)
+            self.setCursor(Qt.CursorShape.SizeHorCursor if part in ("left", "right") else
+                           Qt.CursorShape.OpenHandCursor if part == "inside" else Qt.CursorShape.PointingHandCursor)
+            return
+        c, d = self.canvas, self.drag
+        width = max(1, c.width() - HEADER)
+        if d["part"] == "inside":
+            c.scroll_t = max(0.0, d["scroll"] + (x - d["x"]) / max(1, self.width() - 2 * self.PAD) * self.span())
+        elif d["part"] == "right":  # keep the left edge, move the right one
+            end = max(d["scroll"] + 2 / c.project.fps, self.x2t(x))
+            c.pps = min(MAX_PPS, max(MIN_PPS, width / (end - d["scroll"])))
+            c.scroll_t = d["scroll"]
+        else:  # keep the right edge, move the left one
+            start = min(d["end"] - 2 / c.project.fps, self.x2t(x))
+            c.pps = min(MAX_PPS, max(MIN_PPS, width / (d["end"] - start)))
+            c.scroll_t = max(0.0, d["end"] - width / c.pps)
+        c.view_changed.emit()
+        c.update()
+
+    def mouseReleaseEvent(self, e):
+        self.drag = None
+
+    def mouseDoubleClickEvent(self, e):
+        self.canvas.zoom_fit()
+
+    def wheelEvent(self, e):
+        dy = e.angleDelta().y() or e.angleDelta().x()
+        c = self.canvas
+        c.set_zoom(c.pps * (1.2 if dy > 0 else 1 / 1.2), c.t2x(self.x2t(e.position().x())))
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        W, H = self.width(), self.height()
+        p.fillRect(self.rect(), QColor("#17191d"))
+        c = self.canvas
+        tracks = c.project.video_tracks[::-1] + c.project.audio_tracks
+        if tracks:
+            lane = (H - 8) / len(tracks)
+            for i, tr in enumerate(tracks):
+                y = 4 + i * lane
+                for clip in tr.clips:
+                    col = QColor(CLIP_COLORS.get(clip.kind, QColor("#777")))
+                    if tr.muted:
+                        col = col.darker(180)
+                    x0, x1 = self.t2x(clip.start), self.t2x(clip.end)
+                    p.fillRect(QRectF(x0, y, max(1.0, x1 - x0 - 0.5), max(1.0, lane - 1)), col)
+        for a, b in c.markers:
+            p.fillRect(QRectF(self.t2x(a), 0, max(1.0, self.t2x(b) - self.t2x(a)), 3), QColor("#e05050"))
+        r = self.view_rect()
+        # dim what is outside the visible window
+        p.fillRect(QRectF(0, 0, r.left(), H), QColor(0, 0, 0, 110))
+        p.fillRect(QRectF(r.right(), 0, W - r.right(), H), QColor(0, 0, 0, 110))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor("#9ccaff"), 1.5))
+        p.setBrush(QColor(77, 163, 255, 40))
+        p.drawRoundedRect(r, 4, 4)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#9ccaff"))
+        for hx in (r.left() + 2, r.right() - 5):
+            p.drawRoundedRect(QRectF(hx, r.center().y() - 6, 3, 12), 1.5, 1.5)
+        px = self.t2x(c.playhead)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setPen(QPen(QColor("#ff4d4d"), 1))
+        p.drawLine(int(px), 0, int(px), H)
+        p.end()
+
+
 class Timeline(QWidget):
-    """Canvas + horizontal scrollbar."""
+    """Canvas + zoom bar (navigator, zoom slider, fit/selection buttons, track height)."""
+
+    SLIDER_STEPS = 1000
 
     def __init__(self, main):
         super().__init__()
+        self.main = main
         self.canvas = TimelineCanvas(main)
-        self.hbar = QScrollBar(Qt.Orientation.Horizontal)
+        self.navigator = ZoomNavigator(self.canvas)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(4, 2, 6, 2)
+        bar.setSpacing(3)
+
+        def tool_button(icon_name, tip, fn, text=None):
+            b = QToolButton()
+            if icon_name:
+                b.setIcon(icons.icon(icon_name))
+            if text:
+                b.setText(text)
+            b.setToolTip(tip)
+            b.setAutoRaise(True)
+            b.setIconSize(QSize(16, 16))
+            b.clicked.connect(fn)
+            return b
+
+        c = self.canvas
+        self.span_label = QLabel()
+        self.span_label.setStyleSheet("color:#8a909b; font-family: monospace; padding: 0 4px")
+        self.span_label.setToolTip("Length of timeline currently visible")
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, self.SLIDER_STEPS)
+        self.slider.setFixedWidth(130)
+        self.slider.setToolTip("Timeline zoom (Ctrl+wheel, = / -)")
+        self.slider.valueChanged.connect(self._slider_moved)
+        bar.addWidget(tool_button("zoom_fit", "Zoom to fit the sequence (\\)", c.zoom_fit))
+        bar.addWidget(tool_button(None, "Zoom to the selected clips (Shift+Z)", c.zoom_selection, "Sel"))
+        bar.addWidget(self.navigator, 1)
+        bar.addWidget(tool_button("zoom_out", "Zoom out (-)", lambda: c.set_zoom(c.pps / 1.5)))
+        bar.addWidget(self.slider)
+        bar.addWidget(tool_button("zoom_in", "Zoom in (=)", lambda: c.set_zoom(c.pps * 1.5)))
+        bar.addWidget(self.span_label)
+        sep = QLabel("|")
+        sep.setStyleSheet("color:#3a3f49")
+        bar.addWidget(sep)
+        bar.addWidget(tool_button(None, "Shorter tracks (Alt+-)", lambda: c.scale_tracks(1 / 1.25), "▁"))
+        bar.addWidget(tool_button(None, "Taller tracks (Alt+=) · drag a track's lower edge in its header "
+                                        "to resize just that one", lambda: c.scale_tracks(1.25), "▇"))
+
+        self.vbar = QScrollBar(Qt.Orientation.Vertical)
+        self.vbar.setToolTip("Scroll tracks (Shift+wheel)")
+        self.vbar.valueChanged.connect(self._vbar_moved)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(0)
+        top.addWidget(self.canvas, 1)
+        top.addWidget(self.vbar)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        lay.addWidget(self.canvas, 1)
-        lay.addWidget(self.hbar)
+        lay.addLayout(top, 1)
+        holder = QWidget()
+        holder.setObjectName("zoomBar")
+        holder.setStyleSheet("QWidget#zoomBar { background:#1f2126; border-top:1px solid #15161a; }")
+        holder.setLayout(bar)
+        lay.addWidget(holder)
         self._syncing = False
-        self.canvas.view_changed.connect(self.sync_bar)
-        self.hbar.valueChanged.connect(self._bar_moved)
+        c.view_changed.connect(self.sync_bar)
+
+    def _pps_to_slider(self, pps: float) -> int:
+        return int(round(self.SLIDER_STEPS * math.log(pps / MIN_PPS) / math.log(MAX_PPS / MIN_PPS)))
+
+    def _slider_to_pps(self, v: int) -> float:
+        return MIN_PPS * (MAX_PPS / MIN_PPS) ** (v / self.SLIDER_STEPS)
+
+    def _slider_moved(self, v):
+        if not self._syncing:
+            self.canvas.set_zoom(self._slider_to_pps(v))
+
+    def _vbar_moved(self, v):
+        if not self._syncing:
+            self.canvas.scroll_y = v
+            self.canvas.update()
 
     def sync_bar(self):
         c = self.canvas
         self._syncing = True
-        total = (max(c.project.duration(), c.playhead) + 30) * c.pps
-        page = max(1, c.width() - HEADER)
-        self.hbar.setRange(0, int(max(0, total - page)))
-        self.hbar.setPageStep(page)
-        self.hbar.setSingleStep(40)
-        self.hbar.setValue(int(c.scroll_t * c.pps))
+        self.slider.setValue(self._pps_to_slider(c.pps))
+        overflow = max(0, c.content_height() - c.height())
+        self.vbar.setRange(0, overflow)
+        self.vbar.setPageStep(max(1, c.height()))
+        self.vbar.setSingleStep(20)
+        self.vbar.setValue(c.scroll_y)
+        self.vbar.setVisible(overflow > 0)
         self._syncing = False
-
-    def _bar_moved(self, v):
-        if not self._syncing:
-            self.canvas.scroll_t = v / self.canvas.pps
-            self.canvas.update()
+        self.span_label.setText(fmt_tc(c.visible_seconds(), c.project.fps))
+        self.navigator.update()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)

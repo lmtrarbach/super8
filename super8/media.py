@@ -213,6 +213,45 @@ def thumbnail_rgb(media: MediaItem, width: int = 160) -> np.ndarray | None:
     return f.reformat(width=width, height=h, format="rgb24").to_ndarray()
 
 
+FILMSTRIP_HEIGHT = 54
+FILMSTRIP_MAX_FRAMES = 360
+
+
+def filmstrip(media: MediaItem, height: int = FILMSTRIP_HEIGHT, max_frames: int = FILMSTRIP_MAX_FRAMES,
+              alive=lambda: True):
+    """Small frames spread over a video for the timeline's filmstrip: (times array, list of rgb arrays).
+
+    Short clips are sampled evenly (frame-accurate); long ones decode keyframes only, which is
+    many times faster and still gives a frame every couple of seconds."""
+    if media.kind != "video" or not media.has_video or media.duration <= 0:
+        return None
+    step = max(media.duration / max_frames, 1 / max(1.0, media.fps or 30.0))
+    times, frames = [], []
+    with av.open(media.path) as c:
+        s = _first_visual_stream(c)
+        w = max(2, int(round(height * s.codec_context.width / max(1, s.codec_context.height))) // 2 * 2)
+        offset = float(s.start_time * s.time_base) if s.start_time is not None else 0.0
+        long_clip = media.duration > 180
+        if long_clip:
+            s.codec_context.skip_frame = "NONKEY"
+        s.thread_type = "AUTO"
+        nxt = 0.0
+        for f in c.decode(s):
+            if not alive():
+                return None
+            if f.pts is None:
+                continue
+            t = float(f.pts * f.time_base) - offset
+            if t + 1e-6 < nxt:
+                continue
+            times.append(max(0.0, t))
+            frames.append(f.reformat(width=w, height=height, format="rgb24").to_ndarray())
+            nxt = t + step
+    if not frames:
+        return None
+    return np.array(times), frames
+
+
 class AudioCache:
     """Decoded audio per media id, plus noise-reduced variants computed on demand in the background.
 
@@ -286,16 +325,17 @@ class MediaLoader:
     thread; the UI wires them to Qt signals so they are delivered on the GUI thread.
     """
 
-    def __init__(self, cache: AudioCache, on_thumb, on_audio, on_error):
+    def __init__(self, cache: AudioCache, on_thumb, on_audio, on_error, on_filmstrip=None):
         self.cache = cache
         self.on_thumb, self.on_audio, self.on_error = on_thumb, on_audio, on_error
+        self.on_filmstrip = on_filmstrip
         self.q: queue.Queue = queue.Queue()
         self.alive = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def enqueue(self, media: MediaItem):
-        self.q.put(media)
+        self.q.put((media, "basic"))
 
     def stop(self, timeout: float = 5.0):
         """Stop delivering results (the receiver may be going away) and end the thread."""
@@ -305,10 +345,16 @@ class MediaLoader:
 
     def _run(self):
         while True:
-            m: MediaItem | None = self.q.get()
-            if m is None or not self.alive:
+            item = self.q.get()
+            if item is None or not self.alive:
                 return
+            m, phase = item
             try:
+                if phase == "strip":
+                    strip = filmstrip(m, alive=lambda: self.alive)
+                    if strip is not None and self.alive and self.on_filmstrip:
+                        self.on_filmstrip(m.id, strip)
+                    continue
                 if m.has_video:
                     thumb = thumbnail_rgb(m)
                     if thumb is not None and self.alive:
@@ -319,6 +365,9 @@ class MediaLoader:
                     self.cache.samples[m.id] = data
                     if self.alive:
                         self.on_audio(m.id)
+                if m.kind == "video" and self.on_filmstrip:
+                    # second pass, after every import's thumbnail and audio are done
+                    self.q.put((m, "strip"))
             except Exception as e:
                 traceback.print_exc()
                 if self.alive:
