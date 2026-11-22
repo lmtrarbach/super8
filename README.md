@@ -4,7 +4,7 @@ A non-linear video editor for Linux in the spirit of Premiere, built with PyQt6 
 
 ## Install
 
-From the Snap Store (once published):
+From the Snap Store:
 
 ```bash
 sudo snap install super8-editor
@@ -75,39 +75,6 @@ The same addresses, with copy buttons, are in the app under **Help → Support S
 .venv/bin/python -m pytest          # generates its own sample media on first run
 .venv/bin/python tools/make_icon.py # redraws the app icon (super8/resources, snap/gui)
 ```
-
-### Building the snap
-
-The snap is defined in `snap/snapcraft.yaml` (base `core24`, GNOME extension, amd64 + arm64).
-Pushing a tag like `v0.1.0` runs `.github/workflows/release.yml`: tests, builds the snap,
-attaches it to a GitHub release, and publishes it to the stable channel once the store secret exists.
-The tag must match `__version__` in `super8/__init__.py`.
-
-To build and try it locally (snapcraft needs LXD to build in a clean container):
-
-```bash
-sudo snap install lxd && sudo lxd init --auto && sudo usermod -aG lxd "$USER"   # then log out and back in
-snapcraft pack
-sudo snap install --dangerous ./super8-editor_*.snap
-super8-editor.super8
-```
-
-### Publishing the snap (one-time setup)
-
-1. Create an account at [snapcraft.io](https://snapcraft.io).
-2. On your computer:
-
-   ```bash
-   snapcraft login
-   snapcraft register super8-editor
-   snapcraft export-login --snaps=super8-editor \
-       --acls package_access,package_push,package_update,package_release snap-login.txt
-   gh secret set SNAPCRAFT_STORE_CREDENTIALS --repo lmtrarbach/super8 < snap-login.txt
-   rm snap-login.txt     # it's a password: don't keep it or commit it
-   ```
-
-Until that secret exists, releases still build the `.snap` and attach it to the GitHub release;
-they just skip the Snap Store step.
 
 ## Layout
 - `super8/model.py`: project model and edit operations (no Qt)
