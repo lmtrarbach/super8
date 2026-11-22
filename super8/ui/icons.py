@@ -380,6 +380,17 @@ def _(g):
     g.poly([(6, 4), (18, 4), (18, 15), (12, 20), (6, 15)])
 
 
+@_reg("ai")
+def _(g):
+    def star(cx, cy, r):
+        k = r * 0.28
+        g.poly([(cx, cy - r), (cx + k, cy - k), (cx + r, cy), (cx + k, cy + k), (cx, cy + r),
+                (cx - k, cy + k), (cx - r, cy), (cx - k, cy - k)])
+    star(10, 13, 8)
+    star(18.5, 5.5, 3.6)
+    star(19, 18.5, 2.6)
+
+
 # ------------------------------------------------------------------ public API
 def paint(p: QPainter, name: str, color: QColor, extra: float = 0.0):
     _DRAW[name](_Ctx(p, color, extra))

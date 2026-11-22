@@ -36,6 +36,25 @@ python tools/make_samples.py samples   # generate test clips
 
 Shortcuts: press **F1** in the app.
 
+## AI assistant (Claude)
+
+The **AI Assistant** tab (or **AI ▸ AI Assistant**, Ctrl+Shift+I) lets you edit in plain words:
+*"cut the long pauses"*, *"add a lower third for Jane Doe at 0:05"*, *"what happens around 0:45?"*.
+Claude reads your timeline, looks at frames of your video, and makes the edits with the same tools you
+use. Everything it does for one request is a single undo step (Ctrl+Z).
+
+- **Your own Claude account.** Click *Sign in with Claude*: your browser opens the Claude sign-in page,
+  you approve Super8 and paste back the code it shows. This uses Anthropic's official CLI (`ant`, bundled
+  in the snap; from source, install it from the
+  [anthropic-cli releases](https://github.com/anthropics/anthropic-cli/releases)). It signs in to a
+  Claude Console (Anthropic API) account, and usage is billed to that account. Super8 never sees your
+  password or an API key, and keeps its login in its own folder (`~/.config/super8/anthropic`), separate
+  from any other Claude logins on your machine.
+- **What is sent.** Only when you ask something: the project's structure (clip names, times, titles) and
+  any frames Claude chooses to look at. Your media files are never uploaded.
+- **Models.** Claude Opus 5.5 by default; Sonnet 5.5 and Haiku 5.5 are cheaper choices in the panel.
+- Developers can use `ANTHROPIC_API_KEY` instead of signing in.
+
 ## Support Super8
 
 Super8 is free and open source, and always will be. If it helps you tell your stories,
@@ -98,7 +117,8 @@ they just skip the Snap Store step.
 - `super8/audiofx.py`: loudness envelope, silence detection, noise reduction
 - `super8/graphics.py`: title layout, styling, animation and templates
 - `super8/export.py`: encoder
-- `super8/ui/`: main window, timeline, monitor/bin/inspector/effects/graphics panels, about & support
+- `super8/ai/`: Claude assistant: sign-in (`auth.py`), editor tools (`tools.py`), streamed tool loop (`assistant.py`)
+- `super8/ui/`: main window, timeline, monitor/bin/inspector/effects/graphics/AI panels, about & support
 - `snap/`: snapcraft.yaml, desktop entry and icon
 - `tests/`: pytest suite
 

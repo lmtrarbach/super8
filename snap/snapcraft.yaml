@@ -16,8 +16,11 @@ description: |
   * Silence detector that cuts or speeds up pauses in talking-head footage,
     and background noise reduction
   * Export to H.264/AAC MP4, MKV or MOV
+  * Optional AI assistant: sign in with your own Claude account and ask
+    Claude to look at your footage and make edits for you
 
-  Everything runs locally; Super8 needs no account and no network.
+  Editing runs entirely on your computer. The network is used only by the
+  optional AI assistant, with your Claude account, when you use it.
 license: GPL-3.0-only
 icon: snap/gui/super8.png
 grade: stable
@@ -34,6 +37,7 @@ apps:
       - home
       - removable-media   # footage on USB drives and SD cards
       - audio-playback    # preview playback
+      - network           # only for the optional AI assistant (Claude sign-in and requests)
     environment:
       QT_QPA_PLATFORM: "wayland;xcb"
 
@@ -68,3 +72,23 @@ parts:
       - libxcb-xinerama0
       - libxcb-xkb1
       - libxkbcommon-x11-0
+
+  ant:
+    # Anthropic's official CLI (Apache-2.0), used only for "Sign in with Claude": its browser OAuth
+    # login stores the user's token where the Anthropic SDK reads it. Pinned and checksum-verified.
+    plugin: nil
+    build-packages: [curl]
+    override-build: |
+      VERSION=2.12.1
+      case "$CRAFT_ARCH_BUILD_FOR" in
+        amd64) SHA256=0ff27598096a89bb75c44c0f96e6be8eba405b6426febd54839391eafa6da69e ;;
+        arm64) SHA256=2f203d4b3abd9305f094d31a0e9aa2b17e67a20a08145bf46d69f471a9f666c3 ;;
+        *) echo "no ant build for $CRAFT_ARCH_BUILD_FOR" >&2; exit 1 ;;
+      esac
+      TARBALL="ant_${VERSION}_linux_${CRAFT_ARCH_BUILD_FOR}.tar.gz"
+      curl -fsSL -o "$TARBALL" "https://github.com/anthropics/anthropic-cli/releases/download/v${VERSION}/${TARBALL}"
+      echo "${SHA256}  ${TARBALL}" | sha256sum -c -
+      tar -xzf "$TARBALL" ant LICENSE LICENSE-MIT
+      install -Dm755 ant "$CRAFT_PART_INSTALL/bin/ant"
+      install -Dm644 LICENSE "$CRAFT_PART_INSTALL/usr/share/doc/anthropic-cli/LICENSE"
+      install -Dm644 LICENSE-MIT "$CRAFT_PART_INSTALL/usr/share/doc/anthropic-cli/LICENSE-MIT"

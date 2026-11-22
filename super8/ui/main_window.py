@@ -26,6 +26,8 @@ from .panels import EffectsPanel, GraphicsPanel, Inspector, MediaBin, Monitor, R
 from . import icons
 from .. import __version__
 from .about import AboutDialog, app_icon
+from .ai_panel import AIPanel
+from ..ai import auth
 from .timeline import TOOLS, Timeline, fmt_tc
 
 APP = "Super8"
@@ -227,6 +229,7 @@ class MainWindow(QMainWindow):
         self.rev = 0
         self._clone, self._clone_rev = None, -1
         self._prop_key = None
+        self._batch_before: dict | None = None
 
         self.bridge = Bridge(self)  # parented: dies with the window, so queued results are dropped
         self.bridge.thumb.connect(self._on_thumb)
@@ -337,7 +340,11 @@ class MainWindow(QMainWindow):
         top = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(self.left_tabs)
         top.addWidget(mon_box)
-        top.addWidget(self.inspector_scroll)
+        self.ai = AIPanel(self)
+        self.right_tabs = QTabWidget()
+        self.right_tabs.addTab(self.inspector_scroll, "Inspector")
+        self.right_tabs.addTab(self.ai, icons.icon("ai"), "AI Assistant")
+        top.addWidget(self.right_tabs)
         top.setSizes([330, 860, 290])
         top.setStretchFactor(1, 1)
 
@@ -476,6 +483,13 @@ class MainWindow(QMainWindow):
         self._act(m, "Graphic Bars Transition at Playhead", lambda: self.apply_transition_at_playhead("graphic_bars"))
         self._act(m, "Show Graphics Panel", lambda: self.left_tabs.setCurrentWidget(self.graphics))
 
+        m = mb.addMenu("A&I")
+        A["ai"] = self._act(m, "AI Assistant", self.show_ai, "Ctrl+Shift+I", icon_name="ai",
+                            tip="Ask Claude to look at and edit your project (uses your Claude account)")
+        self._act(m, "Sign in with Claude…", lambda: (self.show_ai(), self.ai.sign_in()))
+        self._act(m, "Sign out of Claude", lambda: (self.ai._sign_in_out() if auth.has_profile_login() else None))
+        self._act(m, "New Chat", self.ai.new_chat)
+
         m = mb.addMenu("&Clip")
         A["transition"] = self._act(m, "Apply Default Transition", lambda: self.apply_transition_at_playhead(),
                                     "Ctrl+D", icon_name="transition",
@@ -498,7 +512,7 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(20, 20))
         for group in (("new", "open", "save"), ("import", "export"), ("undo", "redo"),
                       ("split", "delete", "ripple_delete", "title", "track_add"),
-                      ("transition", "silence", "denoise"), ("snap", "linked"),
+                      ("transition", "silence", "denoise", "ai"), ("snap", "linked"),
                       ("zoom_out", "zoom_in", "zoom_fit")):
             for name in group:
                 tb.addAction(A[name])
@@ -545,10 +559,39 @@ class MainWindow(QMainWindow):
         self.request_frame()
 
     def commit(self, before: dict):
+        if self._batch_before is not None:  # inside an edit batch: one undo step for the whole batch
+            self._prop_key = None
+            self._set_modified()
+            self.changed()
+            return
         self.history.push(before)
         self._prop_key = None
         self._set_modified()
         self.changed()
+
+    # ------------------------------------------------------------- edit batches
+    def begin_batch(self):
+        """Start grouping edits (e.g. everything the AI assistant does for one request) into a single
+        undo step. Undo/redo are paused until end_batch()."""
+        if self._batch_before is None:
+            self._batch_before = self.project.to_dict()
+
+    def end_batch(self) -> bool:
+        """Close the batch; returns True if the project changed (and an undo step was recorded)."""
+        before, self._batch_before = self._batch_before, None
+        if before is None:
+            return False
+        changed = self.project.to_dict() != before
+        if changed:
+            self.history.push(before)
+            self._prop_key = None
+            self._set_modified()
+        self.changed()
+        return changed
+
+    @property
+    def in_batch(self) -> bool:
+        return self._batch_before is not None
 
     def preview_dirty(self):
         self.rev += 1
@@ -837,7 +880,7 @@ class MainWindow(QMainWindow):
         self.commit(before)
 
     def add_title(self, t: float | None = None, track=None, pos: tuple[float, float] | None = None,
-                  preset: str = "basic"):
+                  preset: str = "basic", focus_text: bool = True):
         """Add a graphic from a template. Without a track, use the lowest free video track above content."""
         t = self.project.frame(self.playhead if t is None else t)
         dur = preset_duration(preset)
@@ -862,8 +905,10 @@ class MainWindow(QMainWindow):
         if not (c.start <= self.playhead < c.end):
             self._move_playhead(c.start + min(c.duration / 2, 1.5))
         self.commit(before)
-        self.inspector.widgets["text"].setFocus()
-        self.inspector.widgets["text"].selectAll()
+        if focus_text:
+            self.inspector.widgets["text"].setFocus()
+            self.inspector.widgets["text"].selectAll()
+        return c
 
     def _fill_template_menu(self, menu):
         menu.clear()
@@ -1216,11 +1261,16 @@ class MainWindow(QMainWindow):
         self.inspector.set_clip(self.project, c)
 
     def undo(self):
+        if self.in_batch:
+            self.statusBar().showMessage("Wait for the AI assistant to finish (or stop it) before undoing", 4000)
+            return
         state = self.history.undo(self.project.to_dict())
         if state is not None:
             self._restore(state)
 
     def redo(self):
+        if self.in_batch:
+            return
         state = self.history.redo(self.project.to_dict())
         if state is not None:
             self._restore(state)
@@ -1286,6 +1336,10 @@ class MainWindow(QMainWindow):
 
     def _load_project(self, proj: Project, path: str | None):
         self.stop_play()
+        self.ai.shutdown()
+        if self.in_batch:
+            self._batch_before = None  # the old project's batch no longer applies
+        self.ai.new_chat()  # clip ids belong to the old project
         self.project = proj
         self.project_path = path
         self.history = History()
@@ -1446,8 +1500,15 @@ Ctrl+M export
     def _on_media_error(self, mid: str, msg: str):
         self.statusBar().showMessage(f"Could not decode media: {msg}", 8000)
 
+    def show_ai(self):
+        self.right_tabs.setCurrentWidget(self.ai)
+        self.ai.input.setFocus()
+
     def shutdown(self):
         """Stop every background producer before this window's QObjects go away."""
+        self.ai.shutdown()
+        if self.in_batch:
+            self.end_batch()
         self.bridge.blockSignals(True)
         self.worker.frame_ready.disconnect(self._on_frame)
         self.audio_cache.on_variant = None

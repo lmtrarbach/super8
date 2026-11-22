@@ -39,10 +39,12 @@ class AboutDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         intro = QLabel(
-            "<p><b>Super8 is free and open source.</b> It costs nothing, has no ads, needs no account, and your "
-            "footage never leaves your computer.</p>"
+            "<p><b>Super8 is free and open source.</b> It costs nothing, has no ads and needs no account. "
+            "Editing happens on your computer; the optional AI assistant uses <i>your own</i> Claude account "
+            "and only sends Anthropic your project's structure and the frames Claude looks at when you "
+            "ask it something.</p>"
             "<p>A non-linear video editor for Linux: multi-track timeline, Premiere-style editing tools, "
-            "transitions, animated graphics, silence cutting and noise reduction, powered by FFmpeg.</p>"
+            "transitions, animated graphics, silence cutting, noise reduction and an AI editing assistant, powered by FFmpeg.</p>"
             f"<p>Released under the <a href='{LICENSE_URL}'>GNU General Public License v3.0</a>: you may use, "
             "study, share and improve it.</p>")
         intro.setWordWrap(True)

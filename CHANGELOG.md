@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### AI assistant
+- New **AI Assistant** tab: chat with Claude about your project; it reads the timeline, looks at frames,
+  and edits with tools (add/move/trim/split/delete clips, properties, titles, transitions, silence
+  cutting). Each request is one undo step
+- **Sign in with Claude** using your own account (Anthropic's official CLI, bundled in the snap); the
+  login is kept in Super8's own folder
+- Model choice: Claude Opus 5.5 (default), Sonnet 5.5, Haiku 5.5
+- The snap gains the `network` permission, used only by the assistant
+
 ## 0.2.0 — 2026-11-21
 
 ### Timeline zoom
