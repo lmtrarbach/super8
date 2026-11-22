@@ -13,13 +13,16 @@ license-files = ["LICENSE"]
 dependencies = ["PyQt6>=6.6", "av>=12", "numpy>=1.26", "anthropic>=2.12"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pyflakes"]
+dev = ["pytest", "pyflakes", "setuptools>=77"]
 
 [project.gui-scripts]
 super8 = "super8.__main__:main"
 
-[tool.setuptools]
-packages = ["super8", "super8.ui", "super8.resources"]
+# Discover packages automatically: a hand-written list once left out super8.ai and the snap
+# (a normal, non-editable install) crashed on start. tests/test_packaging.py guards this.
+[tool.setuptools.packages.find]
+include = ["super8*"]
+namespaces = true
 
 [tool.setuptools.dynamic]
 version = {attr = "super8.__version__"}

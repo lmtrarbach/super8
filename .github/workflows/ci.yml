@@ -41,6 +41,13 @@ jobs:
       - run: python -m pytest -q
         env:
           QT_QPA_PLATFORM: offscreen
+      - name: Installed app starts (non-editable install, as in the snap)
+        run: |
+          python -m venv /tmp/installed
+          /tmp/installed/bin/pip install -q .
+          cd /tmp && /tmp/installed/bin/python "$GITHUB_WORKSPACE/tools/smoke_start.py"
+        env:
+          QT_QPA_PLATFORM: offscreen
 
   snap:
     name: Snap (${{ matrix.arch }})
