@@ -6,7 +6,7 @@ import threading
 import traceback
 
 from PyQt6.QtCore import QMimeData, QPointF, QRectF, QSize, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QFont, QIcon, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QDrag, QFont, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFontComboBox, QFormLayout, QHBoxLayout, QLabel, QListWidget,
                              QListWidgetItem, QPlainTextEdit, QPushButton, QSpinBox, QToolButton, QTreeWidget,
                              QTreeWidgetItem, QVBoxLayout,
@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox,
 
 from ..compositor import Compositor
 from ..graphics import ALIGNS, ANIMATIONS, BACKGROUNDS, ROLLS
+from ..transform import FIT_MODES
 from ..transitions import AUDIO_TRANSITIONS, VIDEO_TRANSITIONS
 from ..model import Clip, Project
 from . import icons
@@ -63,41 +64,103 @@ class RenderWorker(QThread):
 
 
 class Monitor(QWidget):
-    """Program monitor. Mouse positions are reported in sequence pixel coordinates."""
+    """Program monitor. Mouse positions are reported in sequence pixel coordinates.
+
+    The main window gives it the selected clip's outline (a rotated quad, in sequence pixels); the
+    monitor draws it with handles and reports which handle a press grabbed: "corner0".."corner3"
+    (resize), "edge_l/_r/_t/_b" (stretch one axis), "rotate", "inside" or "outside"."""
 
     resized = pyqtSignal()
-    pressed = pyqtSignal(QPointF, object)
+    pressed = pyqtSignal(QPointF, object, str)
     dragged = pyqtSignal(QPointF, object)
     released = pyqtSignal()
-    wheeled = pyqtSignal(float)
+    wheeled = pyqtSignal(float, object)
+
+    HANDLE_PX = 9  # grab distance in screen pixels
+    ROTATE_PX = 26  # rotation handle distance above the top edge
 
     def __init__(self):
         super().__init__()
         self.image: QImage | None = None
         self.aspect = 16 / 9
         self.seq_size = (1920, 1080)
-        self.overlay: QRectF | None = None  # selected clip bounds, sequence coords
+        self.overlay: dict | None = None  # {"quad": [4 QPointF], "edges": bool}
+        self.guides: set[str] = set()  # "center", "thirds", "safe"
+        self.snap_lines: list[tuple[str, float]] = []  # ("v", x) / ("h", y) in sequence pixels
         self._down = False
         self.setMinimumSize(320, 180)
+        self.setMouseTracking(True)
+
+    # coordinates -----------------------------------------------------------
+    def scale(self) -> float:
+        """Screen pixels per sequence pixel."""
+        return self.frame_rect().width() / max(1, self.seq_size[0])
 
     def to_seq(self, pos) -> QPointF:
         r = self.frame_rect()
         k = self.seq_size[0] / max(1.0, r.width())
         return QPointF((pos.x() - r.left()) * k, (pos.y() - r.top()) * k)
 
-    def set_overlay(self, rect: QRectF | None):
-        if rect != self.overlay:
-            self.overlay = rect
+    def to_screen(self, pt: QPointF) -> QPointF:
+        r, k = self.frame_rect(), self.scale()
+        return QPointF(r.left() + pt.x() * k, r.top() + pt.y() * k)
+
+    def set_overlay(self, overlay: dict | None):
+        if overlay != self.overlay:
+            self.overlay = overlay
             self.update()
 
+    def handles(self) -> dict[str, QPointF]:
+        """Handle positions in screen pixels."""
+        if not self.overlay:
+            return {}
+        q = [self.to_screen(p) for p in self.overlay["quad"]]
+        hs = {f"corner{i}": q[i] for i in range(4)}
+        mid = lambda a, b: QPointF((a.x() + b.x()) / 2, (a.y() + b.y()) / 2)  # noqa: E731
+        if self.overlay.get("edges", True):
+            hs.update(edge_t=mid(q[0], q[1]), edge_r=mid(q[1], q[2]), edge_b=mid(q[2], q[3]), edge_l=mid(q[3], q[0]))
+        top, bottom = mid(q[0], q[1]), mid(q[3], q[2])
+        dx, dy = top.x() - bottom.x(), top.y() - bottom.y()
+        n = max(1e-6, (dx * dx + dy * dy) ** 0.5)
+        hs["rotate"] = QPointF(top.x() + dx / n * self.ROTATE_PX, top.y() + dy / n * self.ROTATE_PX)
+        return hs
+
+    def handle_at(self, pos: QPointF) -> str:
+        best, best_d = None, self.HANDLE_PX
+        for name, hp in self.handles().items():
+            d = ((hp.x() - pos.x()) ** 2 + (hp.y() - pos.y()) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = name, d
+        if best:
+            return best
+        if self.overlay and QPolygonF([self.to_screen(p) for p in self.overlay["quad"]]).containsPoint(
+                pos, Qt.FillRule.OddEvenFill):
+            return "inside"
+        return "outside"
+
+    # events ----------------------------------------------------------------
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._down = True
-            self.pressed.emit(self.to_seq(e.position()), e.modifiers())
+            self.pressed.emit(self.to_seq(e.position()), e.modifiers(), self.handle_at(e.position()))
 
     def mouseMoveEvent(self, e):
         if self._down:
             self.dragged.emit(self.to_seq(e.position()), e.modifiers())
+            return
+        h = self.handle_at(e.position())
+        if h.startswith("corner"):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor if h in ("corner0", "corner2") else Qt.CursorShape.SizeBDiagCursor)
+        elif h in ("edge_l", "edge_r"):
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif h in ("edge_t", "edge_b"):
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif h == "rotate":
+            self.setCursor(icons.cursor("rotate"))
+        elif h == "inside":
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.unsetCursor()
 
     def mouseReleaseEvent(self, e):
         if self._down and e.button() == Qt.MouseButton.LeftButton:
@@ -105,7 +168,8 @@ class Monitor(QWidget):
             self.released.emit()
 
     def wheelEvent(self, e):
-        self.wheeled.emit(e.angleDelta().y() / 120)
+        steps = (e.angleDelta().y() or e.angleDelta().x()) / 120
+        self.wheeled.emit(steps, e.modifiers())
 
     def frame_rect(self) -> QRectF:
         W, H = self.width(), self.height()
@@ -136,20 +200,52 @@ class Monitor(QWidget):
         if self.image is not None:
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             p.drawImage(r, self.image)
+        p.setClipRect(r)
+        k = self.scale()
+        if self.guides:
+            p.setPen(QPen(QColor(255, 255, 255, 90), 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if "safe" in self.guides:  # action safe 90 %, title safe 80 %
+                for f in (0.9, 0.8):
+                    p.drawRect(QRectF(r.left() + r.width() * (1 - f) / 2, r.top() + r.height() * (1 - f) / 2,
+                                      r.width() * f, r.height() * f))
+            if "thirds" in self.guides:
+                for i in (1, 2):
+                    x = r.left() + r.width() * i / 3
+                    y = r.top() + r.height() * i / 3
+                    p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+                    p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+            if "center" in self.guides:
+                c = r.center()
+                p.drawLine(QPointF(c.x() - 14, c.y()), QPointF(c.x() + 14, c.y()))
+                p.drawLine(QPointF(c.x(), c.y() - 14), QPointF(c.x(), c.y() + 14))
+        if self.snap_lines:
+            p.setPen(QPen(QColor("#ff4dd2"), 1))
+            for axis, v in self.snap_lines:
+                if axis == "v":
+                    x = r.left() + v * k
+                    p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+                else:
+                    y = r.top() + v * k
+                    p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
         if self.overlay is not None:
-            k = r.width() / self.seq_size[0]
-            o = QRectF(r.left() + self.overlay.left() * k, r.top() + self.overlay.top() * k,
-                       self.overlay.width() * k, self.overlay.height() * k)
-            p.setClipRect(r)
+            p.setClipping(False)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            quad = QPolygonF([self.to_screen(pt) for pt in self.overlay["quad"]])
             p.setPen(QPen(QColor("#4da3ff"), 1.5))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(o)
+            p.drawPolygon(quad)
+            hs = self.handles()
+            top = QPointF((quad[0].x() + quad[1].x()) / 2, (quad[0].y() + quad[1].y()) / 2)
+            p.drawLine(top, hs["rotate"])
             p.setBrush(QColor("#ffffff"))
-            for hx in (o.left(), o.center().x(), o.right()):
-                for hy in (o.top(), o.center().y(), o.bottom()):
-                    if (hx, hy) != (o.center().x(), o.center().y()):
-                        p.drawRect(QRectF(hx - 3, hy - 3, 6, 6))
-            p.drawEllipse(o.center(), 3.5, 3.5)
+            p.setPen(QPen(QColor("#1b5fb0"), 1))
+            for name, hp in hs.items():
+                if name == "rotate":
+                    p.drawEllipse(hp, 5, 5)
+                else:
+                    p.drawRect(QRectF(hp.x() - 3.5, hp.y() - 3.5, 7, 7))
+            p.drawEllipse(QPointF(sum(pt.x() for pt in quad) / 4, sum(pt.y() for pt in quad) / 4), 3, 3)
         p.end()
 
 
@@ -291,7 +387,8 @@ class Inspector(QWidget):
     changed = pyqtSignal(str, object)  # field, value
     save_template = pyqtSignal()
 
-    PCT = {"opacity", "scale", "volume", "speed", "denoise", "shadow", "bg_opacity"}
+    PCT = {"opacity", "scale", "volume", "speed", "denoise", "shadow", "bg_opacity", "scale_x", "scale_y",
+           "crop_l", "crop_r", "crop_t", "crop_b"}
 
     def __init__(self):
         super().__init__()
@@ -338,6 +435,7 @@ class Inspector(QWidget):
 
         title = lambda c: c.kind == "title"
         visual = lambda c: c.kind != "audio"
+        media = lambda c: c.kind in ("video", "image")  # pictures from files (not titles)
         audio = lambda c: c.kind == "audio"
         av = lambda c: c.kind in ("video", "audio")
         always = lambda c: True
@@ -375,10 +473,22 @@ class Inspector(QWidget):
                 ("roll", "Motion", combo(ROLLS), title),
             ]),
             ("Transform", [
+                ("fit", "Fit", combo(FIT_MODES), media),
+                ("pos_x", "Position X", dspin(-20000, 20000, 10, 0, " px"), visual),
+                ("pos_y", "Position Y", dspin(-20000, 20000, 10, 0, " px"), visual),
+                ("scale", "Scale", dspin(1, 2000, 5, 1, " %"), visual),
+                ("scale_x", "  Width", dspin(1, 2000, 5, 1, " %"), media),
+                ("scale_y", "  Height", dspin(1, 2000, 5, 1, " %"), media),
+                ("rotation", "Rotation", dspin(-3600, 3600, 15, 1, " °"), visual),
+                ("flip_h", "Flip horizontal", QCheckBox(), media),
+                ("flip_v", "Flip vertical", QCheckBox(), media),
                 ("opacity", "Opacity", dspin(0, 100, 5, 0, " %"), visual),
-                ("scale", "Scale", dspin(1, 1000, 5, 0, " %"), visual),
-                ("pos_x", "Position X", dspin(-10000, 10000, 10, 0, " px"), visual),
-                ("pos_y", "Position Y", dspin(-10000, 10000, 10, 0, " px"), visual),
+            ]),
+            ("Crop", [
+                ("crop_l", "Left", dspin(0, 95, 1, 1, " %"), media),
+                ("crop_r", "Right", dspin(0, 95, 1, 1, " %"), media),
+                ("crop_t", "Top", dspin(0, 95, 1, 1, " %"), media),
+                ("crop_b", "Bottom", dspin(0, 95, 1, 1, " %"), media),
             ]),
             ("Clip", [
                 ("speed", "Speed", dspin(6.25, 1600, 10, 1, " %"), av),
@@ -439,8 +549,7 @@ class Inspector(QWidget):
                 self._update_visibility()
 
     def _reset(self):
-        for k, v in (("opacity", 1.0), ("scale", 1.0), ("pos_x", 0.0), ("pos_y", 0.0)):
-            self.changed.emit(k, v)
+        self.changed.emit("reset_transform", True)
 
     def _update_visibility(self):
         clip = self.clip

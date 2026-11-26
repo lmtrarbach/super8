@@ -23,7 +23,12 @@ python tools/make_samples.py samples   # generate test clips
 - Media bin with thumbnails: video, audio, images (with alpha), drag & drop from your file manager
 - Multi-track timeline (V1..Vn stacked, A1..An mixed), linked A/V clips, snapping, unlimited undo/redo
 - Editing tools: selection, track select forward, ripple, rolling, rate stretch, razor, slip, slide, hand, zoom, type
-- Per-clip opacity, scale, position, speed, volume, fade in/out; move and scale clips in the Program Monitor
+- Transform clips: fit / fill / stretch / original size, scale (also width and height separately), rotation,
+  flips, crop and opacity, with on-screen handles in the Program Monitor (drag corners to resize, edges to
+  stretch, the top handle to rotate) and snapping to the frame centre and edges
+- Aspect ratio presets for any platform (16:9, 9:16 for Shorts/Reels/TikTok, 1:1, 4:5, 4:3, 21:9) and
+  resolutions from 480p to 4K; safe-margin, rule-of-thirds and centre guides; export at another resolution
+- Per-clip speed, volume and fade in/out
 - Transitions: cross dissolve, dip to black/white, wipes, pushes, iris, graphic sweep/bars;
   constant power/gain audio crossfades
 - Essential graphics: 12 animated templates (lower thirds, captions, chapter, typewriter, kinetic words,

@@ -391,6 +391,32 @@ def _(g):
     star(19, 18.5, 2.6)
 
 
+@_reg("rotate")
+def _(g):
+    path = QPainterPath()
+    path.arcMoveTo(QRectF(4, 4, 16, 16), 200)
+    path.arcTo(QRectF(4, 4, 16, 16), 200, -250)
+    g.pen(2)
+    g.p.drawPath(path)
+    end = path.currentPosition()
+    g.line(end.x(), end.y(), end.x() - 4.2, end.y() - 1.0, 2)
+    g.line(end.x(), end.y(), end.x() + 0.6, end.y() - 4.4, 2)
+
+
+@_reg("crop")
+def _(g):
+    g.line(6, 2.5, 6, 18, 1.9)
+    g.line(6, 18, 21.5, 18, 1.9)
+    g.line(2.5, 6, 18, 6, 1.9)
+    g.line(18, 6, 18, 21.5, 1.9)
+
+
+@_reg("aspect")
+def _(g):
+    g.rect(2.5, 6.5, 13, 8, radius=1.2, pw=1.5)
+    g.rect(16, 4, 5.5, 14, radius=1.2, pw=1.5)
+
+
 # ------------------------------------------------------------------ public API
 def paint(p: QPainter, name: str, color: QColor, extra: float = 0.0):
     _DRAW[name](_Ctx(p, color, extra))

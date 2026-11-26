@@ -219,7 +219,9 @@ def test_graphics_workflow(win):
     win.set_playhead(3.0)
     win.pump(0.3)
     ov = win.monitor.overlay
-    assert ov is not None and ov.left() >= 0 and ov.center().y() > win.project.height / 2
+    assert ov is not None
+    xs, ys = [p.x() for p in ov["quad"]], [p.y() for p in ov["quad"]]
+    assert min(xs) >= 0 and sum(ys) / 4 > win.project.height / 2  # the lower third, bottom-left
     # templates: save, persist, reuse
     QInputDialog.getText = staticmethod(lambda *a, **k: ("My Lower Third", True))
     win.save_template()

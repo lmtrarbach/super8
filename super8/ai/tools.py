@@ -16,6 +16,7 @@ from PyQt6.QtGui import QImage
 
 from ..graphics import ANIMATIONS, BACKGROUNDS, ROLLS, all_presets
 from ..model import carve, ripple_ranges, split_all_at, split_with_links
+from ..transform import ASPECTS, FIT_MODES, RESOLUTIONS, clamp_crop, ratio_text, size_for
 from ..transitions import AUDIO_TRANSITIONS, VIDEO_TRANSITIONS
 
 
@@ -33,7 +34,18 @@ SECONDS = {"type": "number", "minimum": 0, "description": "Timeline time in seco
 
 CLIP_PROPS = {
     "opacity": {"type": "number", "minimum": 0, "maximum": 1},
-    "scale": {"type": "number", "minimum": 0.01, "maximum": 10, "description": "1 = fit the frame."},
+    "scale": {"type": "number", "minimum": 0.01, "maximum": 20, "description": "1 = the size the fit mode gives."},
+    "fit": {"type": "string", "enum": list(FIT_MODES),
+            "description": "How a picture fills the frame: fit (letterbox), fill (cover, cropping overflow), "
+                           "stretch, none (original pixel size)."},
+    "scale_x": {"type": "number", "minimum": 0.01, "maximum": 20, "description": "Extra width factor."},
+    "scale_y": {"type": "number", "minimum": 0.01, "maximum": 20, "description": "Extra height factor."},
+    "rotation": {"type": "number", "minimum": -3600, "maximum": 3600, "description": "Degrees, clockwise."},
+    "flip_h": {"type": "boolean"}, "flip_v": {"type": "boolean"},
+    "crop_l": {"type": "number", "minimum": 0, "maximum": 0.95, "description": "Fraction cut from the left."},
+    "crop_r": {"type": "number", "minimum": 0, "maximum": 0.95},
+    "crop_t": {"type": "number", "minimum": 0, "maximum": 0.95},
+    "crop_b": {"type": "number", "minimum": 0, "maximum": 0.95},
     "pos_x": {"type": "number", "description": "Horizontal offset from centre, in sequence pixels."},
     "pos_y": {"type": "number", "description": "Vertical offset from centre, in sequence pixels (down is +)."},
     "volume": {"type": "number", "minimum": 0, "maximum": 4, "description": "Audio gain, 1 = unchanged."},
@@ -66,7 +78,8 @@ TITLE_ONLY = {"text", "subtext", "font_size", "font_family", "bold", "italic", "
               "outline_width", "outline_color", "shadow", "bg_style", "bg_color", "bg_opacity", "accent_color",
               "anim_in", "anim_in_dur", "anim_out", "anim_out_dur", "roll"}
 AUDIO_ONLY = {"volume", "denoise"}
-VISUAL_ONLY = {"opacity", "scale", "pos_x", "pos_y"}
+VISUAL_ONLY = {"opacity", "scale", "pos_x", "pos_y", "rotation"}
+PICTURE_ONLY = {"fit", "scale_x", "scale_y", "flip_h", "flip_v", "crop_l", "crop_r", "crop_t", "crop_b"}
 
 TOOLS: list[dict] = [
     {
@@ -132,9 +145,10 @@ TOOLS: list[dict] = [
     },
     {
         "name": "set_clip_properties",
-        "description": "Change properties of one clip. Visual: opacity, scale, pos_x, pos_y. Audio: volume, "
-                       "denoise. Both: speed, fade_in, fade_out. Titles (graphics) also take text, subtext, "
-                       "fonts, colours, background, animations and roll.",
+        "description": "Change properties of one clip. Visual: opacity, scale, pos_x, pos_y, rotation. Video "
+                       "and image clips also: fit, scale_x, scale_y, flip_h, flip_v, crop_l/r/t/b. Audio: "
+                       "volume, denoise. Both: speed, fade_in, fade_out. Titles (graphics) also take text, "
+                       "subtext, fonts, colours, background, animations and roll.",
         "input_schema": _obj({
             "clip_id": {"type": "string"},
             "properties": {"type": "object", "properties": CLIP_PROPS, "additionalProperties": False,
@@ -198,6 +212,17 @@ TOOLS: list[dict] = [
         }, ["ranges", "mode"]),
     },
     {
+        "name": "set_sequence",
+        "description": "Change the sequence frame: aspect ratio (e.g. 9:16 for Shorts/Reels/TikTok), "
+                       "resolution (short side in pixels) and/or frame rate. Clips keep their fit mode and "
+                       "re-fit; set fit=fill on clips that should fill the new shape.",
+        "input_schema": _obj({
+            "aspect": {"type": "string", "enum": [a[0].split()[0] for a in ASPECTS]},
+            "resolution": {"type": "number", "enum": RESOLUTIONS},
+            "fps": {"type": "number", "enum": [23.976, 24, 25, 29.97, 30, 50, 59.94, 60]},
+        }, []),
+    },
+    {
         "name": "add_track",
         "description": "Add an empty video or audio track.",
         "input_schema": _obj({"kind": {"type": "string", "enum": ["video", "audio"]}}, ["kind"]),
@@ -249,6 +274,8 @@ def validate(value, schema: dict, path: str = "input") -> None:
             raise ToolError(f"{path} must be a number")
         if value < schema.get("minimum", -math.inf) or value > schema.get("maximum", math.inf):
             raise ToolError(f"{path}={value} is out of range [{schema.get('minimum')}, {schema.get('maximum')}]")
+        if "enum" in schema and not any(abs(value - e) < 1e-9 for e in schema["enum"]):
+            raise ToolError(f"{path}={value} is not one of {schema['enum']}")
     elif t == "string":
         if not isinstance(value, str):
             raise ToolError(f"{path} must be a string")
@@ -317,12 +344,18 @@ class Toolkit:
         if c.link:
             d["linked_to"] = [x.id for x in p.linked(c) if x is not c]
         defaults = {"speed": 1.0, "opacity": 1.0, "scale": 1.0, "pos_x": 0.0, "pos_y": 0.0, "volume": 1.0,
-                    "fade_in": 0.0, "fade_out": 0.0, "denoise": 0.0}
+                    "fade_in": 0.0, "fade_out": 0.0, "denoise": 0.0, "scale_x": 1.0, "scale_y": 1.0,
+                    "rotation": 0.0, "crop_l": 0.0, "crop_r": 0.0, "crop_t": 0.0, "crop_b": 0.0}
         for k, dv in defaults.items():
             v = getattr(c, k)
-            if abs(v - dv) > 1e-9 and not (c.kind == "audio" and k in VISUAL_ONLY) \
+            if abs(v - dv) > 1e-9 and not (c.kind == "audio" and k in VISUAL_ONLY | PICTURE_ONLY) \
                     and not (c.kind != "audio" and k in AUDIO_ONLY):
                 d[k] = _r(v)
+        if c.kind in ("video", "image"):
+            d["fit"] = c.fit
+            for k in ("flip_h", "flip_v"):
+                if getattr(c, k):
+                    d[k] = True
         if c.tin:
             d["transition_in"] = {"kind": c.tin, "duration": _r(c.tin_dur)}
         if c.tout:
@@ -336,7 +369,8 @@ class Toolkit:
     def t_get_project(self):
         p, c = self.project, self.main.timeline.canvas
         return {
-            "sequence": {"width": p.width, "height": p.height, "fps": p.fps, "duration": _r(p.duration())},
+            "sequence": {"width": p.width, "height": p.height, "fps": p.fps, "duration": _r(p.duration()),
+                         "aspect": ratio_text(p.width, p.height)},
             "playhead": _r(self.main.playhead),
             "selected_clip_ids": sorted(c.selection),
             "media": [{"id": m.id, "name": m.name, "kind": m.kind, "duration": _r(m.duration),
@@ -462,6 +496,7 @@ class Toolkit:
         tr, c = self._clip(clip_id)
         bad = [k for k in properties if (k in TITLE_ONLY and c.kind != "title")
                or (k in AUDIO_ONLY and c.kind != "audio") or (k in VISUAL_ONLY and c.kind == "audio")
+               or (k in PICTURE_ONLY and c.kind not in ("video", "image"))
                or (k == "speed" and c.kind not in ("video", "audio"))]
         if bad:
             raise ToolError(f"{', '.join(bad)} cannot be set on a {c.kind} clip")
@@ -474,7 +509,24 @@ class Toolkit:
             if k == "denoise" and c.media_id:
                 self.main.audio_cache.request(c.media_id, v)
         c.fade_in, c.fade_out = min(c.fade_in, c.duration), min(c.fade_out, c.duration)
+        c.crop_l, c.crop_r = clamp_crop(c.crop_l, c.crop_r)
+        c.crop_t, c.crop_b = clamp_crop(c.crop_t, c.crop_b)
         return {"updated": self._clip_json(c)}
+
+    def t_set_sequence(self, aspect=None, resolution=None, fps=None):
+        if aspect is None and resolution is None and fps is None:
+            raise ToolError("give aspect, resolution and/or fps")
+        p = self.project
+        if aspect is None:
+            aw, ah = p.width, p.height
+        else:
+            aw, ah = next((w, h) for label, w, h in ASPECTS if label.split()[0] == aspect)
+        short = int(resolution) if resolution is not None else min(p.width, p.height)
+        w, h = size_for(aw, ah, short) if aspect is not None else (
+            (int(round(short * aw / ah / 2)) * 2, short) if aw >= ah else (short, int(round(short * ah / aw / 2)) * 2))
+        self.main.set_sequence_format(w, h, float(fps) if fps else None)
+        return {"sequence": {"width": p.width, "height": p.height, "fps": p.fps,
+                             "aspect": ratio_text(p.width, p.height)}}
 
     def t_add_title(self, template, start, duration=None, text=None, subtext=None, track=None, properties=None):
         if template not in all_presets():

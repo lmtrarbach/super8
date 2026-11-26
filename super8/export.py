@@ -15,9 +15,12 @@ AAC_FRAME = 1024
 
 
 def export_project(project: Project, cache: AudioCache, path: str, crf: int = 20, preset: str = "medium",
-                   progress=None, cancel: threading.Event | None = None) -> bool:
-    """Blocking export. `progress(done_frames, total_frames)`. Returns False if cancelled."""
-    W, H = project.width // 2 * 2, project.height // 2 * 2
+                   progress=None, cancel: threading.Event | None = None,
+                   size: tuple[int, int] | None = None) -> bool:
+    """Blocking export. `progress(done_frames, total_frames)`. Returns False if cancelled.
+    `size` renders at another resolution (positions and titles scale with it)."""
+    W, H = size if size else (project.width, project.height)
+    W, H = int(W) // 2 * 2, int(H) // 2 * 2
     sr = project.sample_rate
     rate = Fraction(project.fps).limit_denominator(1001)
     total = project.duration()

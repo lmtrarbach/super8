@@ -46,6 +46,17 @@ class Clip:
     scale: float = 1.0
     pos_x: float = 0.0  # offset in sequence pixels from centre
     pos_y: float = 0.0
+    # transform (see transform.py): how the picture fits the frame, then stretch, flip, crop, rotate
+    fit: str = "fit"  # fit (letterbox) | fill (cover, crop overflow) | stretch | none (original size)
+    scale_x: float = 1.0  # extra width / height factors on top of `scale` (non-uniform scaling)
+    scale_y: float = 1.0
+    rotation: float = 0.0  # degrees, clockwise, around the picture's centre
+    flip_h: bool = False
+    flip_v: bool = False
+    crop_l: float = 0.0  # fraction of the source cut from each side
+    crop_r: float = 0.0
+    crop_t: float = 0.0
+    crop_b: float = 0.0
     # audio properties
     volume: float = 1.0
     # both

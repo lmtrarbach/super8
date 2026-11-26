@@ -2,36 +2,94 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import numpy as np
+from PyQt6.QtCore import QRectF
+from PyQt6.QtGui import QImage, QPainter, QTransform
 
 from .media import AudioCache, ReaderPool
 from .graphics import render_graphic, title_cache_key
+from .transform import clip_box
 from .model import Clip, Project, transition_windows
 from .transitions import audio_gains, compose
 
 MAX_LAYER = 8192
 
 
-def blit(canvas: np.ndarray, src: np.ndarray, x0: int, y0: int, alpha: float) -> None:
-    H, W = canvas.shape[:2]
-    h, w = src.shape[:2]
-    cx0, cy0 = max(0, x0), max(0, y0)
-    cx1, cy1 = min(W, x0 + w), min(H, y0 + h)
-    if cx1 <= cx0 or cy1 <= cy0:
+class Frame:
+    """An RGB frame owned by a QImage, with a NumPy view onto the same pixels.
+
+    QPainter composites into it (fast, SIMD, transforms) and NumPy code (transitions, fast copies)
+    writes the very same memory. A QImage wrapping a NumPy buffer would copy on first paint, so the
+    QImage has to own the memory."""
+
+    def __init__(self, W: int, H: int):
+        self.image = QImage(W, H, QImage.Format.Format_RGB888)
+        self.image.fill(0)
+        ptr = self.image.bits()
+        ptr.setsize(self.image.sizeInBytes())
+        self.array = np.ndarray((H, W, 3), np.uint8, buffer=ptr, strides=(self.image.bytesPerLine(), 3, 1))
+
+
+@dataclass
+class Placed:
+    """A clip's picture ready to draw: `arr` is 1:1 with canvas pixels; the `src` region of it is drawn
+    with its top-left at (x, y), then mirrored and rotated around (cx, cy)."""
+    arr: np.ndarray  # uint8 RGB or straight-alpha RGBA
+    x: int
+    y: int
+    src: tuple[int, int, int, int]  # sx, sy, sw, sh (the crop)
+    alpha: float
+    cx: float = 0.0
+    cy: float = 0.0
+    rotation: float = 0.0
+    flip_h: bool = False
+    flip_v: bool = False
+
+    @property
+    def transformed(self) -> bool:
+        return bool(self.rotation % 360) or self.flip_h or self.flip_v
+
+    def transform(self) -> QTransform:
+        t = QTransform()
+        t.translate(self.cx, self.cy)
+        t.rotate(self.rotation)
+        t.scale(-1 if self.flip_h else 1, -1 if self.flip_v else 1)  # mirror first, then rotate
+        t.translate(-self.cx, -self.cy)
+        return t
+
+
+def paint(target: QImage, pl: Placed) -> None:
+    """Draw a placed picture onto a QImage: crop (source rect), flips, rotation and opacity in one go."""
+    arr = np.ascontiguousarray(pl.arr)  # already contiguous straight from the decoder
+    h, w, ch = arr.shape
+    fmt = QImage.Format.Format_RGBA8888 if ch == 4 else QImage.Format.Format_RGB888
+    img = QImage(arr.data, w, h, ch * w, fmt)
+    sx, sy, sw, sh = pl.src
+    p = QPainter(target)
+    if pl.transformed:
+        if pl.rotation % 90:  # flips and quarter turns map pixels exactly: no filtering needed
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setTransform(pl.transform())
+    p.setOpacity(max(0.0, min(1.0, pl.alpha)))
+    p.drawImage(QRectF(pl.x, pl.y, sw, sh), img, QRectF(sx, sy, sw, sh))
+    p.end()
+
+
+def blit(frame: Frame, pl: Placed) -> None:
+    """Composite a placed picture onto the frame."""
+    if not pl.transformed and pl.arr.shape[2] == 3 and pl.alpha >= 0.999:  # opaque, axis-aligned: copy
+        canvas = frame.array
+        H, W = canvas.shape[:2]
+        sx, sy, sw, sh = pl.src
+        cx0, cy0 = max(0, pl.x), max(0, pl.y)
+        cx1, cy1 = min(W, pl.x + sw), min(H, pl.y + sh)
+        if cx1 > cx0 and cy1 > cy0:
+            canvas[cy0:cy1, cx0:cx1] = pl.arr[sy + cy0 - pl.y:sy + cy1 - pl.y, sx + cx0 - pl.x:sx + cx1 - pl.x]
         return
-    s = src[cy0 - y0:cy1 - y0, cx0 - x0:cx1 - x0]
-    dst = canvas[cy0:cy1, cx0:cx1]
-    if s.shape[2] == 4:
-        a = s[..., 3:4].astype(np.float32) * (alpha / 255.0)
-        rgb = s[..., :3]
-    elif alpha >= 0.999:
-        dst[...] = s
-        return
-    else:
-        a = np.float32(alpha)
-        rgb = s
-    dst[...] = (rgb * a + dst * (1.0 - a) + 0.5).astype(np.uint8)
+    paint(frame.image, pl)
 
 
 class Compositor:
@@ -47,7 +105,7 @@ class Compositor:
 
     # ------------------------------------------------------------ video
     def render(self, project: Project, t: float, W: int, H: int) -> np.ndarray:
-        canvas = np.zeros((H, W, 3), np.uint8)
+        frame = Frame(W, H)
         for track in project.video_tracks:  # V1 is the bottom layer
             if track.muted:
                 continue
@@ -56,17 +114,19 @@ class Compositor:
                 kind, A, B, p = tx
                 la = self._layer(project, A, t, W, H) if A is not None else None
                 lb = self._layer(project, B, t, W, H) if B is not None else None
-                over(canvas, compose(kind, la, lb, p, W, H))
+                over(frame.array, compose(kind, la, lb, p, W, H))
                 continue
             clip = track.clip_at(t)
             if clip is not None:
                 placed = self._place(project, clip, t, W, H)
                 if placed is not None:
-                    blit(canvas, *placed)
-        return canvas
+                    blit(frame, placed)
+        # always a real copy: the view aliases the QImage's memory, which is freed with `frame`
+        # (np.ascontiguousarray would return the view itself whenever rows have no padding)
+        return frame.array.copy()
 
     def _place(self, project, clip: Clip, t, W, H):
-        """Pixels for one clip at time t: (array rgb|rgba uint8, x0, y0, alpha) or None."""
+        """The clip's picture at time t, ready to draw (a Placed), or None when nothing shows."""
         local = min(max(t - clip.start, 0.0), clip.duration)  # transitions may sample past the edges
         alpha = clip.opacity * clip.envelope(local)
         if alpha <= 0.002:
@@ -80,7 +140,11 @@ class Compositor:
                 while len(self.titles) > 64:
                     self.titles.popitem(last=False)
             res = self.titles[key]
-            return None if res is None else (res[0], res[1], res[2], alpha)
+            if res is None:
+                return None
+            arr, x0, y0 = res
+            h, w = arr.shape[:2]
+            return Placed(arr, x0, y0, (0, 0, w, h), alpha, x0 + w / 2, y0 + h / 2, clip.rotation)
         media = project.media.get(clip.media_id)
         if media is None:
             return None
@@ -90,33 +154,35 @@ class Compositor:
         frame = reader.frame_at(clip.source_time(t))
         if frame is None:
             return None
-        fit = min(W / frame.width, H / frame.height) * clip.scale
-        w = min(MAX_LAYER, max(2, int(round(frame.width * fit))))
-        h = min(MAX_LAYER, max(2, int(round(frame.height * fit))))
-        x0 = int(round(W / 2 + clip.pos_x * W / project.width - w / 2))
-        y0 = int(round(H / 2 + clip.pos_y * H / project.height - h / 2))
-        if x0 >= W or y0 >= H or x0 + w <= 0 or y0 + h <= 0:
-            return None
+        box = clip_box(clip, frame.width, frame.height, W, H, project.width, project.height)
+        bx0, by0, bx1, by1 = box.bbox()
+        if bx0 >= W or by0 >= H or bx1 <= 0 or by1 <= 0 or box.fw < 1 or box.fh < 1:
+            return None  # off screen
+        fw = min(MAX_LAYER, max(2, int(round(box.fw))))
+        fh = min(MAX_LAYER, max(2, int(round(box.fh))))
         fmt = "rgba" if reader.has_alpha else "rgb24"
-        arr = frame.reformat(width=w, height=h, format=fmt, interpolation="BILINEAR").to_ndarray()
-        return arr, x0, y0, alpha
+        arr = frame.reformat(width=fw, height=fh, format=fmt, interpolation="BILINEAR").to_ndarray()
+        l, r, t, b = box.crop  # crop in source orientation: a source rect, no pixel copy
+        sx, sy = int(round(l * fw)), int(round(t * fh))
+        sw, sh = fw - sx - int(round(r * fw)), fh - sy - int(round(b * fh))
+        if sw < 1 or sh < 1:
+            return None
+        x0 = int(round(box.cx - box.fw / 2)) + sx  # unflipped position; flips mirror around (cx, cy)
+        y0 = int(round(box.cy - box.fh / 2)) + sy
+        return Placed(arr, x0, y0, (sx, sy, sw, sh), alpha, box.cx, box.cy, box.rotation, box.flip_h, box.flip_v)
 
     def _layer(self, project, clip: Clip, t, W, H) -> np.ndarray | None:
         """The clip as a full-canvas premultiplied float RGBA layer (used by transitions)."""
         placed = self._place(project, clip, t, W, H)
         if placed is None:
             return None
-        src, x0, y0, alpha = placed
-        h, w = src.shape[:2]
-        cx0, cy0, cx1, cy1 = max(0, x0), max(0, y0), min(W, x0 + w), min(H, y0 + h)
-        layer = np.zeros((H, W, 4), np.float32)
-        if cx1 <= cx0 or cy1 <= cy0:
-            return layer
-        s = src[cy0 - y0:cy1 - y0, cx0 - x0:cx1 - x0].astype(np.float32) / 255.0
-        a = (s[..., 3:4] if s.shape[2] == 4 else np.ones_like(s[..., :1])) * alpha
-        layer[cy0:cy1, cx0:cx1, :3] = s[..., :3] * a
-        layer[cy0:cy1, cx0:cx1, 3:4] = a
-        return layer
+        img = QImage(W, H, QImage.Format.Format_RGBA8888_Premultiplied)
+        img.fill(0)
+        paint(img, placed)
+        ptr = img.constBits()
+        ptr.setsize(img.sizeInBytes())
+        rgba = np.frombuffer(ptr, np.uint8).reshape(H, img.bytesPerLine())[:, :W * 4].reshape(H, W, 4)
+        return rgba.astype(np.float32) / 255.0  # already premultiplied
 
     # ------------------------------------------------------------ audio
     def mix(self, project: Project, t0: float, n: int) -> np.ndarray:

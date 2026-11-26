@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import traceback
 
 import numpy as np
-from PyQt6.QtCore import QElapsedTimer, QObject, QPointF, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QActionGroup, QColor, QImage, QKeySequence, QPalette
+from PyQt6.QtCore import QElapsedTimer, QObject, QPointF, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QImage, QKeySequence, QPalette, QPolygonF
 from PyQt6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                              QHBoxLayout, QLabel, QInputDialog, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressDialog,
                              QPushButton, QGridLayout, QSizePolicy, QSpinBox, QScrollArea, QSplitter, QTabWidget, QToolButton,
@@ -22,6 +23,7 @@ from ..audiofx import envelope_db
 from ..transitions import AUDIO_TRANSITIONS, DEFAULT_VIDEO, VIDEO_TRANSITIONS, for_track, short_label
 from .audio_tools import NoiseDialog, SilenceDialog
 from ..graphics import USER_PRESETS, all_presets, apply_preset, block_rect, preset_duration, template_from_clip
+from ..transform import ASPECTS, FIT_MODES, RESOLUTIONS, Box, aspect_of, clamp_crop, clip_box, ratio_text, reset_transform, size_for
 from .panels import EffectsPanel, GraphicsPanel, Inspector, MediaBin, Monitor, RenderWorker
 from . import icons
 from .. import __version__
@@ -134,43 +136,85 @@ class AudioPlayer:
 
 # ===================================================================== dialogs
 class SequenceDialog(QDialog):
+    """Frame shape (aspect ratio), resolution and frame rate of the sequence."""
+
     def __init__(self, parent, project: Project):
         super().__init__(parent)
         self.setWindowTitle("Sequence Settings")
         f = QFormLayout(self)
+        self.aspect = QComboBox()
+        for label, aw, ah in ASPECTS:
+            self.aspect.addItem(label, (aw, ah))
+        self.aspect.addItem("Custom", None)
+        self.res = QComboBox()
+        for r in RESOLUTIONS:
+            self.res.addItem({480: "480p SD", 720: "720p HD", 1080: "1080p Full HD", 1440: "1440p QHD",
+                              2160: "2160p 4K UHD"}[r], r)
         self.w = QSpinBox()
         self.w.setRange(16, 7680)
         self.w.setSingleStep(2)
-        self.w.setValue(project.width)
         self.h = QSpinBox()
-        self.h.setRange(16, 4320)
+        self.h.setRange(16, 7680)
         self.h.setSingleStep(2)
-        self.h.setValue(project.height)
-        self.preset = QComboBox()
-        self.presets = [("Custom", None), ("4K UHD 3840×2160", (3840, 2160)), ("1080p 1920×1080", (1920, 1080)),
-                        ("720p 1280×720", (1280, 720)), ("Vertical 1080×1920", (1080, 1920)),
-                        ("Square 1080×1080", (1080, 1080))]
-        for name, _ in self.presets:
-            self.preset.addItem(name)
-        self.preset.currentIndexChanged.connect(self._apply_preset)
         self.fps = QComboBox()
         for v in FPS_CHOICES:
             self.fps.addItem(f"{v:g}", v)
         self.fps.setCurrentIndex(min(range(len(FPS_CHOICES)), key=lambda i: abs(FPS_CHOICES[i] - project.fps)))
-        f.addRow("Preset", self.preset)
+        self.summary = QLabel()
+        self.summary.setStyleSheet("color:#9aa0ab")
+        f.addRow("Aspect ratio", self.aspect)
+        f.addRow("Resolution", self.res)
         f.addRow("Width", self.w)
         f.addRow("Height", self.h)
         f.addRow("Frame rate", self.fps)
+        f.addRow(self.summary)
+        note = QLabel("Clips keep their Fit mode, so they adapt to a new shape. Use Clip ▸ Transform ▸ "
+                      "Fill Frame to fill it.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#7d8390; font-size:11px")
+        f.addRow(note)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         f.addRow(bb)
+        self._sync = False
+        self.w.setValue(project.width)
+        self.h.setValue(project.height)
+        self._from_size()
+        self.aspect.currentIndexChanged.connect(self._from_presets)
+        self.res.currentIndexChanged.connect(self._from_presets)
+        self.w.valueChanged.connect(self._from_size)
+        self.h.valueChanged.connect(self._from_size)
 
-    def _apply_preset(self, i):
-        v = self.presets[i][1]
-        if v:
-            self.w.setValue(v[0])
-            self.h.setValue(v[1])
+    def _from_presets(self):
+        if self._sync:
+            return
+        ratio = self.aspect.currentData()
+        if ratio is None:
+            return
+        w, h = size_for(*ratio, self.res.currentData())
+        self._sync = True
+        self.w.setValue(w)
+        self.h.setValue(h)
+        self._sync = False
+        self._summary()
+
+    def _from_size(self):
+        if self._sync:
+            return
+        w, h = self.w.value(), self.h.value()
+        self._sync = True
+        label = aspect_of(w, h)
+        self.aspect.setCurrentIndex(self.aspect.findText(label) if label else self.aspect.count() - 1)
+        short = min(w, h)
+        self.res.setCurrentIndex(min(range(len(RESOLUTIONS)), key=lambda i: abs(RESOLUTIONS[i] - short)))
+        self._sync = False
+        self._summary()
+
+    def _summary(self):
+        w, h = self.w.value() // 2 * 2, self.h.value() // 2 * 2
+        shape = "landscape" if w > h else "portrait" if h > w else "square"
+        self.summary.setText(f"{w} × {h} · {ratio_text(w, h)} {shape}")
 
 
 class ExportDialog(QDialog):
@@ -197,6 +241,15 @@ class ExportDialog(QDialog):
         self.speed = QComboBox()
         self.speed.addItems(self.SPEED)
         self.speed.setCurrentText("medium")
+        self.size = QComboBox()
+        pw, ph = project.width // 2 * 2, project.height // 2 * 2
+        self.size.addItem(f"Same as sequence ({pw}×{ph})", (pw, ph))
+        for r in reversed(RESOLUTIONS):
+            w, h = (int(round(r * pw / ph / 2)) * 2, r) if pw >= ph else (r, int(round(r * ph / pw / 2)) * 2)
+            if (w, h) != (pw, ph):
+                self.size.addItem(f"{r}p ({w}×{h})", (w, h))
+        self.size.setToolTip("Scale the whole video on export; the shape (aspect ratio) stays the same")
+        f.addRow("Resolution", self.size)
         f.addRow("Quality", self.quality)
         f.addRow("Encoder speed", self.speed)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -301,6 +354,29 @@ class MainWindow(QMainWindow):
         for b in buttons:
             transport.addWidget(b)
         transport.addStretch(1)
+        self.aspect_btn = QToolButton()
+        self.aspect_btn.setIcon(icons.icon("aspect"))
+        self.aspect_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.aspect_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.aspect_btn.setToolTip("Sequence aspect ratio and size")
+        self.aspect_menu = QMenu(self)
+        self.aspect_menu.aboutToShow.connect(self._fill_aspect_menu)
+        self.aspect_btn.setMenu(self.aspect_menu)
+        self.guides_btn = QToolButton(text="Guides")
+        self.guides_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.guides_btn.setToolTip("Overlay guides in the Program Monitor")
+        gm = QMenu(self)
+        saved = set(str(self.settings.value("monitor_guides", "") or "").split(",")) - {""}
+        for key, label in (("safe", "Safe Margins (action 90 %, title 80 %)"), ("thirds", "Rule of Thirds"),
+                           ("center", "Center Mark")):
+            act = gm.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(key in saved)
+            act.toggled.connect(lambda on, key=key: self._set_guide(key, on))
+        self.monitor.guides = saved
+        self.guides_btn.setMenu(gm)
+        transport.addWidget(self.aspect_btn)
+        transport.addWidget(self.guides_btn)
         transport.addWidget(self.dur_label)
         mv.addLayout(transport)
 
@@ -491,6 +567,9 @@ class MainWindow(QMainWindow):
         self._act(m, "New Chat", self.ai.new_chat)
 
         m = mb.addMenu("&Clip")
+        tm = m.addMenu(icons.icon("crop"), "Transform")
+        self._fill_transform_menu(tm)
+        m.addSeparator()
         A["transition"] = self._act(m, "Apply Default Transition", lambda: self.apply_transition_at_playhead(),
                                     "Ctrl+D", icon_name="transition",
                                     tip="Cross dissolve (video) / constant power (audio) at the edit nearest "
@@ -549,6 +628,8 @@ class MainWindow(QMainWindow):
         if rebuild_bin:
             self.bin.rebuild(self.project, self.thumbs)
         self.monitor.aspect = self.project.width / self.project.height
+        self.aspect_btn.setText(f"{ratio_text(self.project.width, self.project.height)} · "
+                                f"{self.project.width}×{self.project.height}")
         self.monitor.seq_size = (self.project.width, self.project.height)
         self.seq_label.setText(f"Sequence: {self.project.width}×{self.project.height} @ {self.project.fps:g} fps")
         self.dur_label.setText(fmt_tc(self.project.duration(), self.project.fps))
@@ -1130,6 +1211,8 @@ class MainWindow(QMainWindow):
                     a = sub.addAction(name, lambda v=v: self.set_denoise(audio_sel, v))
                     a.setCheckable(True)
                     a.setChecked(abs(clip.denoise - v) < 0.01)
+            if tr.kind == "video":
+                self._fill_transform_menu(menu.addMenu(icons.icon("crop"), "Transform"))
             menu.addSeparator()
             menu.addAction(icons.icon("split"), "Split at Playhead", self.split_at_playhead)
             menu.addAction(icons.icon("delete"), "Delete", lambda: self.delete_selected(False))
@@ -1142,6 +1225,85 @@ class MainWindow(QMainWindow):
             menu.addAction("Clear Silence Marks", self.clear_marks)
         menu.exec(gpos)
 
+    def _fill_transform_menu(self, menu: QMenu):
+        for action, label in (("fit", "Fit to Frame (letterbox)"), ("fill", "Fill Frame (crop to fit)"),
+                              ("stretch", "Stretch to Frame"), ("none", "Original Size"), (None, None),
+                              ("rotate_cw", "Rotate 90° Clockwise"), ("rotate_ccw", "Rotate 90° Counter-clockwise"),
+                              ("flip_h", "Flip Horizontal"), ("flip_v", "Flip Vertical"), (None, None),
+                              ("reset", "Reset Transform")):
+            if action is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(label, lambda a=action: self.transform_selected(a))
+
+    def _fill_aspect_menu(self):
+        m = self.aspect_menu
+        m.clear()
+        P = self.project
+        short = min(P.width, P.height)
+        current = aspect_of(P.width, P.height)
+        for label, aw, ah in ASPECTS:
+            w, h = size_for(aw, ah, short)
+            act = m.addAction(f"{label}  ·  {w}×{h}", lambda w=w, h=h: self.set_sequence_format(w, h))
+            act.setCheckable(True)
+            act.setChecked(label == current)
+        m.addSeparator()
+        res = m.addMenu("Resolution")
+        for r in RESOLUTIONS:
+            aw, ah = P.width, P.height
+            w, h = (int(round(r * aw / ah / 2)) * 2, r) if aw >= ah else (r, int(round(r * ah / aw / 2)) * 2)
+            act = res.addAction(f"{r}p  ·  {w}×{h}", lambda w=w, h=h: self.set_sequence_format(w, h))
+            act.setCheckable(True)
+            act.setChecked(r == short)
+        m.addSeparator()
+        m.addAction("Sequence Settings…", self.sequence_dialog)
+
+    def _set_guide(self, key: str, on: bool):
+        (self.monitor.guides.add if on else self.monitor.guides.discard)(key)
+        self.settings.setValue("monitor_guides", ",".join(sorted(self.monitor.guides)))
+        self.monitor.update()
+
+    def transform_selected(self, action: str, clips=None):
+        """Fit / fill / stretch / original size / reset / rotate / flip the selected visual clips
+        (or the one under the playhead), as one undo step."""
+        if clips is None:
+            clips = [c for c in self.selected_clips() if c.kind != "audio"]
+            if not clips:
+                c = self.visual_clip_at_playhead(selected_only=False)
+                clips = [c] if c else []
+        if not clips:
+            self.statusBar().showMessage("Select a video, image or title clip first", 3000)
+            return
+        before = self.project.to_dict()
+        for c in clips:
+            media = c.kind in ("video", "image")
+            if action in FIT_MODES and media:
+                c.fit, c.scale, c.scale_x, c.scale_y, c.pos_x, c.pos_y = action, 1.0, 1.0, 1.0, 0.0, 0.0
+            elif action == "reset":
+                reset_transform(c)
+            elif action in ("rotate_cw", "rotate_ccw"):
+                c.rotation = ((c.rotation + (90 if action == "rotate_cw" else -90) + 180) % 360) - 180
+            elif action == "flip_h" and media:
+                c.flip_h = not c.flip_h
+            elif action == "flip_v" and media:
+                c.flip_v = not c.flip_v
+        self.commit(before)
+
+    def set_sequence_format(self, width: int, height: int, fps: float | None = None):
+        """Change the sequence frame size (aspect ratio / resolution) and frame rate, as one undo step.
+        Clips keep their fit mode, so they re-fit the new frame automatically."""
+        width, height = max(16, int(width) // 2 * 2), max(16, int(height) // 2 * 2)
+        P = self.project
+        if (width, height) == (P.width, P.height) and (fps is None or fps == P.fps):
+            return
+        before = P.to_dict()
+        P.width, P.height = width, height
+        if fps:
+            P.fps = fps
+        self.commit(before)
+        self.statusBar().showMessage(f"Sequence: {width}×{height} ({ratio_text(width, height)}) @ {P.fps:g} fps · "
+                                     "use Clip ▸ Transform ▸ Fill Frame to fill the new shape", 6000)
+
     def on_property(self, field: str, value):
         clip = self.inspector.clip
         if clip is None:
@@ -1149,12 +1311,19 @@ class MainWindow(QMainWindow):
         if field == "speed":
             self._set_speed(clip, value)
             return
+        if field == "reset_transform":
+            self.transform_selected("reset", clips=[clip])
+            return
         key = (clip.id, field)
         if self._prop_key != key:  # coalesce continuous tweaks of one property into one undo step
             self.history.push(self.project.to_dict())
             self._set_modified()
         self._prop_key = key
         setattr(clip, field, value)
+        if field in ("crop_l", "crop_r"):
+            clip.crop_l, clip.crop_r = clamp_crop(clip.crop_l, clip.crop_r)
+        elif field in ("crop_t", "crop_b"):
+            clip.crop_t, clip.crop_b = clamp_crop(clip.crop_t, clip.crop_b)
         if field == "denoise" and clip.media_id:
             self.audio_cache.request(clip.media_id, value)
         if field in ("tin", "tout"):
@@ -1189,44 +1358,78 @@ class MainWindow(QMainWindow):
                 return c
         return None
 
-    def clip_frame_rect(self, c: Clip) -> QRectF | None:
-        """Where a visual clip lands, in sequence pixels."""
+    def clip_seq_box(self, c: Clip) -> Box | None:
+        """Where a visual clip lands, in sequence pixels (centre, size, crop, rotation)."""
         P = self.project
-        cx, cy = P.width / 2 + c.pos_x, P.height / 2 + c.pos_y
         if c.kind == "title":
-            return block_rect(c, P.width, P.height, self.playhead - c.start)
+            r = block_rect(c, P.width, P.height, self.playhead - c.start)
+            return Box(r.center().x(), r.center().y(), r.width(), r.height(), rotation=c.rotation)
         m = P.media.get(c.media_id)
         if m is None or not m.width or not m.height:
             return None
-        fit = min(P.width / m.width, P.height / m.height) * c.scale
-        w, h = m.width * fit, m.height * fit
-        return QRectF(cx - w / 2, cy - h / 2, w, h)
+        return clip_box(c, m.width, m.height, P.width, P.height, P.width, P.height)
+
+    def _clip_contains(self, c: Clip, pt: QPointF) -> bool:
+        box = self.clip_seq_box(c)
+        return box is not None and QPolygonF([QPointF(x, y) for x, y in box.corners()]).containsPoint(
+            pt, Qt.FillRule.OddEvenFill)
 
     def update_monitor_overlay(self):
         c = self.visual_clip_at_playhead(selected_only=True)
-        self.monitor.set_overlay(None if (c is None or self.playing) else self.clip_frame_rect(c))
+        box = None if (c is None or self.playing) else self.clip_seq_box(c)
+        if box is None:
+            self.monitor.set_overlay(None)
+            return
+        self.monitor.set_overlay({"quad": [QPointF(x, y) for x, y in box.corners()],
+                                  "edges": c.kind in ("video", "image")})
 
-    def on_monitor_press(self, pt: QPointF, mods):
+    def on_monitor_press(self, pt: QPointF, mods, handle: str = "outside"):
         if self.timeline.canvas.tool == "type":
             self.add_title(pos=(pt.x() - self.project.width / 2, pt.y() - self.project.height / 2))
             return
         clip = self.visual_clip_at_playhead(selected_only=True)
-        if clip is None or not (self.clip_frame_rect(clip) or QRectF()).contains(pt):
+        if handle == "outside" or clip is None:
             # click selects the topmost clip under the pointer
             clip = None
             for tr in reversed(self.project.video_tracks):
                 c = tr.clip_at(self.playhead)
-                if c is not None and not tr.muted and (self.clip_frame_rect(c) or QRectF()).contains(pt):
+                if c is not None and not tr.muted and self._clip_contains(c, pt):
                     clip = c
                     break
             canvas = self.timeline.canvas
             canvas.selection = canvas.group_of(clip, mods) if clip else set()
             canvas.update()
             self._refresh_inspector()
+            handle = "inside"
         if clip is not None:
-            self._mon_drag = {"id": clip.id, "pt": pt, "pos": (clip.pos_x, clip.pos_y),
-                              "before": self.project.to_dict(), "changed": False}
+            box = self.clip_seq_box(clip)
+            self._mon_drag = {"id": clip.id, "pt": pt, "handle": handle, "box": box,
+                              "pos": (clip.pos_x, clip.pos_y), "scale": clip.scale, "sx": clip.scale_x,
+                              "sy": clip.scale_y, "rot": clip.rotation, "before": self.project.to_dict(),
+                              "changed": False}
         self.update_monitor_overlay()
+
+    def _snap_move(self, c: Clip, mods) -> list[tuple[str, float]]:
+        """Snap a moved clip's centre (and, unrotated, its edges) to the frame's centre and edges."""
+        if mods & Qt.KeyboardModifier.ControlModifier:  # Ctrl: no snapping
+            return []
+        box = self.clip_seq_box(c)
+        if box is None:
+            return []
+        P = self.project
+        thr = 8 / max(1e-6, self.monitor.scale())
+        x0, y0, x1, y1 = box.bbox()
+        lines = []
+        for axis, cands in (("v", [(P.width / 2, box.cx)] + ([(0, x0), (P.width, x1)] if not box.rotation % 360 else [])),
+                            ("h", [(P.height / 2, box.cy)] + ([(0, y0), (P.height, y1)] if not box.rotation % 360 else []))):
+            best = min(cands, key=lambda tv: abs(tv[0] - tv[1]))
+            if abs(best[0] - best[1]) <= thr:
+                if axis == "v":
+                    c.pos_x += best[0] - best[1]
+                else:
+                    c.pos_y += best[0] - best[1]
+                lines.append((axis, best[0]))
+        return lines
 
     def on_monitor_drag(self, pt: QPointF, mods):
         d = getattr(self, "_mon_drag", None)
@@ -1235,13 +1438,38 @@ class MainWindow(QMainWindow):
         _, c = self.project.find_clip(d["id"])
         if c is None:
             return
-        dx, dy = pt.x() - d["pt"].x(), pt.y() - d["pt"].y()
-        if mods & Qt.KeyboardModifier.ShiftModifier:  # constrain to one axis
-            if abs(dx) > abs(dy):
-                dy = 0
+        h, box = d["handle"], d["box"]
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        snap_lines = []
+        if h.startswith("corner") and box is not None:  # resize, keeping the proportions
+            d0 = math.hypot(d["pt"].x() - box.cx, d["pt"].y() - box.cy)
+            d1 = math.hypot(pt.x() - box.cx, pt.y() - box.cy)
+            c.scale = min(20.0, max(0.01, d["scale"] * d1 / max(1e-6, d0)))
+        elif h.startswith("edge") and box is not None:  # stretch one axis (pictures only)
+            lx0, ly0 = box.to_local(d["pt"].x(), d["pt"].y())
+            lx1, ly1 = box.to_local(pt.x(), pt.y())
+            if h in ("edge_l", "edge_r"):
+                c.scale_x = min(20.0, max(0.01, d["sx"] * abs(lx1) / max(1e-6, abs(lx0))))
             else:
-                dx = 0
-        c.pos_x, c.pos_y = round(d["pos"][0] + dx), round(d["pos"][1] + dy)
+                c.scale_y = min(20.0, max(0.01, d["sy"] * abs(ly1) / max(1e-6, abs(ly0))))
+        elif h == "rotate" and box is not None:  # Shift: 15-degree steps
+            a0 = math.degrees(math.atan2(d["pt"].y() - box.cy, d["pt"].x() - box.cx))
+            a1 = math.degrees(math.atan2(pt.y() - box.cy, pt.x() - box.cx))
+            rot = d["rot"] + (a1 - a0)
+            if shift:
+                rot = round(rot / 15) * 15
+            c.rotation = round(((rot + 180) % 360) - 180, 2)
+        else:  # move; Shift locks an axis, Ctrl turns snapping off
+            dx, dy = pt.x() - d["pt"].x(), pt.y() - d["pt"].y()
+            if shift:
+                if abs(dx) > abs(dy):
+                    dy = 0
+                else:
+                    dx = 0
+            c.pos_x, c.pos_y = d["pos"][0] + dx, d["pos"][1] + dy
+            snap_lines = self._snap_move(c, mods)
+            c.pos_x, c.pos_y = round(c.pos_x), round(c.pos_y)
+        self.monitor.snap_lines = snap_lines
         d["changed"] = True
         self.preview_dirty()
         self.update_monitor_overlay()
@@ -1249,15 +1477,21 @@ class MainWindow(QMainWindow):
 
     def on_monitor_release(self):
         d, self._mon_drag = getattr(self, "_mon_drag", None), None
+        self.monitor.snap_lines = []
+        self.monitor.update()
         if d and d["changed"]:
             self.commit(d["before"])
 
-    def on_monitor_wheel(self, steps: float):
+    def on_monitor_wheel(self, steps: float, mods=None):
+        """Wheel scales the selected clip; Alt+wheel rotates it."""
         c = self.visual_clip_at_playhead(selected_only=True)
         if c is None:
             return
         self.inspector.clip = c
-        self.on_property("scale", max(0.01, min(10.0, c.scale * (1.05 ** steps))))
+        if mods is not None and mods & Qt.KeyboardModifier.AltModifier:
+            self.on_property("rotation", round(((c.rotation + 5 * steps + 180) % 360) - 180, 2))
+        else:
+            self.on_property("scale", max(0.01, min(20.0, c.scale * (1.05 ** steps))))
         self.inspector.set_clip(self.project, c)
 
     def undo(self):
@@ -1290,11 +1524,7 @@ class MainWindow(QMainWindow):
     def sequence_dialog(self):
         d = SequenceDialog(self, self.project)
         if d.exec():
-            before = self.project.to_dict()
-            self.project.width = d.w.value() // 2 * 2
-            self.project.height = d.h.value() // 2 * 2
-            self.project.fps = d.fps.currentData()
-            self.commit(before)
+            self.set_sequence_format(d.w.value(), d.h.value(), d.fps.currentData())
 
     # ------------------------------------------------------------- files
     def maybe_save(self) -> bool:
@@ -1442,7 +1672,7 @@ class MainWindow(QMainWindow):
             try:
                 ok = export_project(proj, self.audio_cache, path, crf=d.quality.currentData(),
                                     preset=d.speed.currentText(), progress=self.bridge.export_progress.emit,
-                                    cancel=cancel)
+                                    cancel=cancel, size=d.size.currentData())
                 self.bridge.export_done.emit(ok, "")
             except Exception as e:
                 traceback.print_exc()

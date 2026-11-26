@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Transform and aspect ratio
+- Clip transforms: fit mode (fit, fill, stretch, original size), width/height scaling, rotation,
+  horizontal/vertical flip and crop, in the Inspector and as **Clip ▸ Transform** actions
+- Program Monitor handles: drag corners to resize, edges to stretch, the top handle to rotate (Shift:
+  15° steps); moving snaps to the frame centre and edges (Ctrl: no snapping); Alt+wheel rotates
+- Aspect ratio button under the monitor (16:9, 9:16, 1:1, 4:5, 4:3, 21:9 and resolutions); reworked
+  Sequence Settings; safe-margin, rule-of-thirds and centre guides
+- Export at a different resolution, keeping the aspect ratio
+- Faster compositing: titles, transparent images, opacity and rotated clips are drawn by Qt directly into
+  the frame (a rotated full-HD layer went from ~96 ms to ~26 ms)
+- The AI assistant can transform clips and change the sequence's aspect ratio
+
 ### AI assistant
 - New **AI Assistant** tab: chat with Claude about your project; it reads the timeline, looks at frames,
   and edits with tools (add/move/trim/split/delete clips, properties, titles, transitions, silence

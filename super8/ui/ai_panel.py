@@ -18,6 +18,8 @@ SUGGESTIONS = [
     ("Add a lower third", "Add a lower third near the start introducing the speaker. Ask me the name."),
     ("Polish the edit", "Suggest and apply small improvements: transitions between clips, fades at the "
                         "start and end, and a title."),
+    ("Make it vertical", "Turn this into a 9:16 vertical video for Shorts, Reels and TikTok: change the "
+                         "sequence and make the video clips fill the frame, keeping the subject in view."),
 ]
 
 
@@ -36,6 +38,7 @@ TOOL_LABELS = {
     "cut_ranges": "Cut ranges",
     "add_track": "Added a track",
     "show": "Moved the playhead",
+    "set_sequence": "Changed the sequence frame",
 }
 
 
