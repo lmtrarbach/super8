@@ -65,20 +65,25 @@ use. Everything it does for one request is a single undo step (Ctrl+Z).
 Super8 is free and open source, and always will be. If it helps you tell your stories,
 you can support its development with a donation:
 
+**By card:** [donate.stripe.com/5kQbJ1agL0eaaMA2vI9R600](https://donate.stripe.com/5kQbJ1agL0eaaMA2vI9R600)
+(choose any amount; payments are handled by Stripe)
+
+**In crypto:**
+
 | Coin | Address |
 |---|---|
 | Bitcoin | `bc1qnyceh488yqr0l6ffljygf47243p8wsvct4mkw7` |
 | Ethereum | `0x8bc6D2D3d47D15EEd881975A09F008609F3bAdF2` |
 | Solana | `3Gq3t2Xoix8eRvyxCE8mdB5BPsNCwHxDVc8oLXMTeFe1` |
 
-The same addresses, with copy buttons, are in the app under **Help → Support Super8**.
+Both are in the app under **Help → Support Super8**: a *Donate with card* button and the addresses
+with copy buttons.
 
 ## Development
 
 ```bash
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/python -m pytest          # generates its own sample media on first run
-.venv/bin/python tools/make_icon.py # redraws the app icon (super8/resources, snap/gui)
 ```
 
 ## Layout

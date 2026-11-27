@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### New logo
+- The new Super8 logo is the app, window and Snap Store icon
+
+### Donations
+- **Donate with card** in Help ▸ Support Super8, through a Stripe Payment Link (pay what you want);
+  shown once the link is set in `super8/donate.py`. `tools/stripe_setup.py` creates the product, price
+  and link in Stripe and is safe to re-run
+
 ### Transform and aspect ratio
 - Clip transforms: fit mode (fit, fill, stretch, original size), width/height scaling, rotation,
   horizontal/vertical flip and crop, in the Inspector and as **Clip ▸ Transform** actions

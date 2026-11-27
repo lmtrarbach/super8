@@ -3,22 +3,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFontDatabase, QGuiApplication, QIcon, QPixmap
+from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QIcon, QPixmap
 from PyQt6.QtWidgets import (QDialog, QDialogButtonBox, QFrame, QGridLayout, QLabel, QLineEdit, QPushButton,
                              QVBoxLayout)
 
 from .. import __version__
+from ..donate import CRYPTO, stripe_link
 
 LICENSE_URL = "https://www.gnu.org/licenses/gpl-3.0.html"
 ICON_PATH = Path(__file__).resolve().parent.parent / "resources" / "super8.png"
 
-# Same addresses as Candle (Help → Support Candle).
-DONATIONS = (
-    ("Bitcoin", "bc1qnyceh488yqr0l6ffljygf47243p8wsvct4mkw7"),
-    ("Ethereum", "0x8bc6D2D3d47D15EEd881975A09F008609F3bAdF2"),
-    ("Solana", "3Gq3t2Xoix8eRvyxCE8mdB5BPsNCwHxDVc8oLXMTeFe1"),
-)
+DONATIONS = CRYPTO  # crypto addresses (see super8/donate.py for all donation settings)
 
 
 def app_icon() -> QIcon:
@@ -50,9 +46,19 @@ class AboutDialog(QDialog):
         intro.setWordWrap(True)
         intro.setOpenExternalLinks(True)
 
+        card = stripe_link()
         support = QLabel("<b>Support Super8</b><br>If Super8 helps you tell your stories, you can support its "
-                         "development with a donation to one of these addresses:")
+                         "development with a donation" + (" by card, or in crypto to one of these addresses:"
+                                                          if card else " to one of these addresses:"))
         support.setWordWrap(True)
+        self.card_button = None
+        if card:
+            self.card_button = QPushButton("💳  Donate with card")
+            self.card_button.setToolTip("Opens Stripe's secure checkout in your browser · choose any amount")
+            self.card_button.setStyleSheet("QPushButton { background:#635bff; color:white; font-weight:bold; "
+                                           "padding:8px 14px; border-radius:6px; } "
+                                           "QPushButton:hover { background:#7a73ff; }")
+            self.card_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(card)))
 
         mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         grid = QGridLayout()
@@ -75,6 +81,11 @@ class AboutDialog(QDialog):
         box.setStyleSheet("QFrame#card { background:#2b2f37; border:1px solid #3a3f49; border-radius:8px; }")
         bv = QVBoxLayout(box)
         bv.addWidget(support)
+        if self.card_button is not None:
+            bv.addWidget(self.card_button, 0, Qt.AlignmentFlag.AlignLeft)
+            stripe_note = QLabel("Card payments are handled by Stripe; Super8 never sees your card details.")
+            stripe_note.setStyleSheet("color:#9aa0ab; font-size:11px")
+            bv.addWidget(stripe_note)
         bv.addLayout(grid)
         thanks = QLabel("Thank you ♥")
         thanks.setStyleSheet("color:#9aa0ab")
